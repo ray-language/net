@@ -1,0 +1,171 @@
+// SCRAM-SHA-256 (RFC 5802 + RFC 7677) escrito EN raylang — el mecanismo de autenticación por desafío
+// que usa PostgreSQL (M32.1). Apila PBKDF2 sobre HMAC-SHA256 + SHA-256 (std/crypto, ring) y base64.
+// M60: TODO en `bytes` de punta a punta — desaparecieron las conversiones [int]↔bytes.
+//
+// Flujo del cliente: envía `client-first` (n=usuario, r=nonce); recibe `server-first` (r=nonce+snonce,
+// s=salt, i=iteraciones); calcula la prueba del cliente (ClientProof) y envía `client-final`; verifica
+// la firma del servidor del `server-final`. Importable: `from scram import scram_first, scram_final, scram_verify, Scram;`.
+from std/base64 import base64, base64_decode;
+import std/crypto;
+
+// El estado de una conversación SCRAM en el cliente.
+/// Client-side state of a SCRAM-SHA-256 conversation (RFC 5802 / RFC 7677).
+/// Created by `scram_first`; `scram_final` fills in the expected server signature.
+pub struct Scram {
+    client_first_bare: string,
+    server_sig: bytes,
+}
+
+// "n=usuario,r=nonce"
+// la firma del servidor ESPERADA (se llena en scram_final, se verifica al final)
+// XOR de dos `bytes` de igual longitud.
+fn xor_bytes(a: bytes, b: bytes) -> bytes {
+    var out: [int] = [];
+    var i = 0;
+    while (i < a.len()) {
+        out.push(a[i] ^ b[i]);
+        i = i + 1;
+    }
+    bytes_of(out)
+}
+
+// PBKDF2-HMAC-SHA256 con dkLen = 32 (un solo bloque): result = U1 ⊕ U2 ⊕ … ⊕ Uc, con U1 = HMAC(pw,
+// salt‖INT(1)) y Ui = HMAC(pw, U_{i-1}).
+fn pbkdf2_sha256(pw: bytes, salt: bytes, iterations: int) -> bytes {
+    var msg: [int] = [];
+    var i = 0;
+    while (i < salt.len()) {
+        msg.push(salt[i]);
+        i = i + 1;
+    }
+    msg.push(0);  // INT(1) big-endian
+    msg.push(0);
+    msg.push(0);
+    msg.push(1);
+    var u = crypto.hmac_sha256(pw, bytes_of(msg));  // U1
+    var result = u;
+    var c = 1;
+    while (c < iterations) {
+        u = crypto.hmac_sha256(pw, u);  // Ui = HMAC(pw, U_{i-1})
+        result = xor_bytes(result, u);
+        c = c + 1;
+    }
+    result
+}
+
+// RFC 5802 §5.1: en el nombre de usuario (`n=`), '=' se envía como '=3D' y ',' como '=2C'. Sin esto,
+// un usuario con ',' o '=' corrompería el mensaje SCRAM o inyectaría atributos (`r=`, `n=`, …). El
+// orden importa: escapar '=' ANTES que ',' (si no, el '=' que introduce '=2C' se re-escaparía).
+fn escape_saslname(s: string) -> string {
+    s.replace("=", "=3D").replace(",", "=2C")
+}
+
+// El `client-first-message` completo (a enviar): "n,,n=usuario,r=nonce". `nonce` lo genera el llamador.
+/// Starts a SCRAM conversation: builds the client-first-bare message ("n=user,r=nonce").
+/// The caller supplies the random `nonce`; send `scram_client_first_message` on the wire.
+/// The username is escaped per RFC 5802 §5.1 (',' → '=2C', '=' → '=3D').
+pub fn scram_first(username: string, nonce: string) -> Scram {
+    Scram { client_first_bare: "n=" + escape_saslname(username) + ",r=" + nonce, server_sig: b"" }
+}
+
+// El texto GS2+bare que se manda como client-first (con el header "n,,").
+/// The full client-first-message to send on the wire: GS2 header "n,," + client-first-bare.
+pub fn scram_client_first_message(sc: Scram) -> string {
+    "n,," + sc.client_first_bare
+}
+
+// Devuelve el valor de un atributo `k=valor` en un mensaje `a=..,b=..,..` separado por comas.
+fn attr(msg: string, key: string) -> string {
+    let parts = msg.split(",");
+    var v = "";
+    var i = 0;
+    while (i < parts.len()) {
+        let p = parts[i];
+        if (p.len() >= 2 && p[0] == key[0] && p[1] == '=') {
+            v = p.substring(2, p.len());
+        }
+        i = i + 1;
+    }
+    v
+}
+
+// Procesa el `server-first` y produce el `client-final-message` (con la prueba). Guarda en `sc` la firma
+// del servidor esperada para verificarla luego con `scram_verify`.
+/// Processes the server-first-message and returns the client-final-message (with ClientProof).
+/// Runs PBKDF2-HMAC-SHA256 over the password (CPU cost grows with the iteration count) and
+/// stores the expected ServerSignature in `sc` for `scram_verify`.
+/// `Err` on an invalid iteration count or bad base64 salt in `server_first`.
+pub fn scram_final(sc: Scram, password: string, server_first: string) -> Result<string, string> {
+    let rnonce = attr(server_first, "r");  // nonce combinado
+    // RFC 5802 §5.1 (MUST): el nonce del servidor debe EXTENDER el del cliente (empezar por él); si no,
+    // el server-first no está ligado a esta sesión (replay / MITM). El nonce del cliente vive en el
+    // client-first-bare que guardamos.
+    let client_nonce = attr(sc.client_first_bare, "r");
+    if (client_nonce == "" || !rnonce.starts_with(client_nonce)) {
+        return Result.Err("the server nonce does not extend the client's (possible replay/MITM)");
+    }
+    let salt_b64 = attr(server_first, "s");
+    let iter_str = attr(server_first, "i");
+    let iterations = match (parse_int(iter_str)) {
+        Option.Some(n) => n,
+        Option.None => {
+            return Result.Err("invalid iterations in server-first");
+        },
+    };
+    // El recuento de iteraciones lo fija el servidor; un valor enorme haría girar PBKDF2 sin fin en el
+    // cliente (bomba de CPU, clase M64.2). Se acota a un máximo generoso (RFC 7677 exige >= 4096).
+    if (iterations < 1) {
+        return Result.Err("invalid iterations in server-first (must be >= 1)");
+    }
+    if (iterations > 10000000) {
+        return Result.Err("excessive server iterations (possible DoS): " + to_string(iterations));
+    }
+    let salt = match (base64_decode(salt_b64)) {
+        Result.Ok(s) => s,
+        Result.Err(e) => {
+            return Result.Err("invalid base64 salt: " + e);
+        },
+    };
+
+    let client_final_noproof = "c=biws,r=" + rnonce;
+    let auth_msg = sc.client_first_bare + "," + server_first + "," + client_final_noproof;
+
+    let salted = pbkdf2_sha256(password.to_bytes(), salt, iterations);
+    let client_key = crypto.hmac_sha256(salted, "Client Key".to_bytes());
+    let stored_key = crypto.sha256(client_key);
+    let client_sig = crypto.hmac_sha256(stored_key, auth_msg.to_bytes());
+    let proof = xor_bytes(client_key, client_sig);
+
+    let server_key = crypto.hmac_sha256(salted, "Server Key".to_bytes());
+    sc.server_sig = crypto.hmac_sha256(server_key, auth_msg.to_bytes());
+
+    Result.Ok(client_final_noproof + ",p=" + base64(proof))
+}
+
+// Verifica el `server-final` ("v=<firma en base64>"): la firma debe coincidir con la esperada.
+/// Verifies the server-final-message ("v=<base64 signature>") against the ServerSignature
+/// computed in `scram_final`, using a constant-time comparison. Call after `scram_final`;
+/// false means the server does not know the password (or the message is malformed).
+pub fn scram_verify(sc: Scram, server_final: string) -> bool {
+    // Si `scram_final` no se ejecutó (o falló), la firma esperada está vacía: nada que verificar.
+    // Sin esta guarda, un servidor que mandara `v=` (base64 vacío) casaría con longitud 0 → `true`.
+    if (sc.server_sig.len() == 0) {
+        return false;
+    }
+    let v = attr(server_final, "v");
+    match (base64_decode(v)) {
+        Result.Ok(sig) => {
+            if (sig.len() != sc.server_sig.len()) {
+                return false;
+            }
+            var diff = 0;
+            var i = 0;
+            while (i < sig.len()) {
+                diff = diff | sig[i] ^ sc.server_sig[i];
+                i = i + 1;
+            }
+            diff == 0
+        },
+        Result.Err(e) => false,
+    }
+}

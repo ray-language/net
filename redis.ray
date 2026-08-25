@@ -1,0 +1,270 @@
+// Cliente Redis (protocolo RESP2) escrito EN raylang, sobre los builtins TCP (M15.2). Cero runtime
+// nuevo. Importable: `from redis import connect, command, close_conn, Reply, reply_str;`.
+//
+// RESP es deliberadamente simple: una petición es un *array de bulk strings*
+//   *<n>\r\n $<len>\r\n <arg>\r\n ...
+// y una respuesta empieza por un byte de tipo: `+` simple string, `-` error, `:` entero,
+// `$` bulk string (`$-1` = nil), `*` array. Es el mejor ejemplo de "cliente de infra cloud" en
+// raylang puro: request/response con framing sobre un socket.
+//
+// M69: el framing es 100% **bytes** — RESP exige longitudes en OCTETOS y la versión anterior
+// (todo `string`) contaba caracteres: `SET k ñ` declaraba `$1` y enviaba 2 octetos →
+// desincronización del protocolo con cualquier valor no-ASCII. La API pública sigue hablando
+// `string` (los valores se decodifican como UTF-8; uno no decodificable llega como "?").
+// Además: longitud RESP malformada = `Err` (antes 0 en silencio) y tope de bulk (anti-memoria).
+//
+// Como los sockets ceden la fibra, el camino concurrente corre en la **VM y el binario nativo**;
+// en el intérprete corren bloqueantes (un hilo), así que el cliente funciona en los tres motores
+// contra un servidor real.
+import std/net;
+
+// Una respuesta de Redis (RESP2).
+/// A Redis reply (RESP2): simple/bulk string, integer, nil, array, or server error.
+pub enum Reply {
+    Str(string),  // simple string (+) o bulk string ($)
+    Int(int),  // entero (:)
+    Nil,  // bulk/array nulo ($-1 / *-1)
+    Arr([Reply]),  // array (*)
+    Err(string),  // error del servidor (-)
+}
+
+// Tope de un bulk string declarado por el servidor (64 MiB, como el anti-bomba de M64.2):
+// un `$<gigante>` de un servidor roto/malicioso es `Err`, no agotamiento de memoria.
+fn max_bulk() -> int {
+    67108864
+}
+
+// Conexión: el handle del socket + un buffer de lectura no consumido (framing por encima de los
+// trozos que entrega `socket_read_bytes`).
+/// A Redis connection: the TCP socket handle plus an unconsumed read buffer
+/// (framing on top of the chunks `socket_read_bytes` delivers).
+pub struct Conn {
+    h: int,
+    buf: bytes,
+}
+
+/// Opens a TCP connection to a Redis server at `host:port`.
+/// Err carries the connection error message.
+pub fn connect(host: string, port: int) -> Result<Conn, string> {
+    match (net.tcp_connect(host, port)) {
+        Result.Ok(h) => Result.Ok(Conn { h: h, buf: b"" }),
+        Result.Err(e) => Result.Err(e),
+    }
+}
+
+/// Closes the connection's socket.
+pub fn close_conn(c: Conn) {
+    close(c.h);
+}
+
+// Codifica un comando (lista de argumentos) como un array RESP de bulk strings. Las longitudes
+// van en OCTETOS (M69): `to_bytes().len()`, no `len()` (caracteres).
+/// Encodes a command (argument list) as a RESP array of bulk strings
+/// (`*<n>\r\n` then `$<len>\r\n<arg>\r\n` per argument, lengths in BYTES), the Redis request
+/// wire format.
+pub fn encode_command(args: [string]) -> bytes {
+    var out = ("*" + to_string(args.len()) + "\r\n").to_bytes();
+    var i = 0;
+    while (i < args.len()) {
+        let b = args[i].to_bytes();
+        out = out + ("$" + to_string(b.len()) + "\r\n").to_bytes() + b + "\r\n".to_bytes();
+        i = i + 1;
+    }
+    out
+}
+
+// Lee un trozo más del socket al buffer; false si la conexión se cerró (EOF) o falló.
+fn pull(c: Conn) -> bool {
+    match (net.socket_read_bytes(c.h)) {
+        Result.Ok(chunk) => {
+            if (chunk.len() == 0) {
+                false
+            } else {
+                c.buf = c.buf + chunk;
+                true
+            }
+        },
+        Result.Err(_) => false,
+    }
+}
+
+// Posición del primer \r\n en `b` desde `desde`, o -1 (como find_crlf del cliente HTTP).
+fn find_crlf(b: bytes, start: int) -> int {
+    var i = start;
+    while (i + 1 < b.len()) {
+        if (b[i] == 13 && b[i + 1] == 10) {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+// Texto de unos bytes, o "?" si no son UTF-8 válido (las líneas de protocolo son ASCII; un
+// payload no-UTF-8 degrada visiblemente, no corrompe el framing).
+fn text(b: bytes) -> string {
+    match (from_utf8(b)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => "?",
+    }
+}
+
+// Lee una línea terminada en \r\n (sin el CRLF, decodificada), rellenando desde el socket.
+fn read_line(c: Conn) -> Result<string, string> {
+    while (true) {
+        let pos = find_crlf(c.buf, 0);
+        if (pos >= 0) {
+            let line = text(c.buf.sub_bytes(0, pos));
+            c.buf = c.buf.sub_bytes(pos + 2, c.buf.len());
+            return Result.Ok(line);
+        }
+        if (!pull(c)) {
+            return Result.Err("connection closed while reading a line");
+        }
+    }
+    Result.Err("unreachable")
+}
+
+// Lee exactamente `n` OCTETOS, rellenando desde el socket si hace falta.
+fn read_n(c: Conn, n: int) -> Result<bytes, string> {
+    while (c.buf.len() < n) {
+        if (!pull(c)) {
+            return Result.Err("connection closed while reading the body");
+        }
+    }
+    let b = c.buf.sub_bytes(0, n);
+    c.buf = c.buf.sub_bytes(n, c.buf.len());
+    Result.Ok(b)
+}
+
+// Longitud/entero RESP: malformado = Err claro (M69; antes 0 en silencio, que enmascaraba
+// errores de protocolo).
+fn parse_len(s: string) -> Result<int, string> {
+    match (parse_int(s)) {
+        Option.Some(n) => Result.Ok(n),
+        Option.None => Result.Err("invalid RESP length: '" + s + "'"),
+    }
+}
+
+// Lee y parsea UNA respuesta RESP (recursiva para los arrays).
+fn read_reply(c: Conn) -> Result<Reply, string> {
+    match (read_line(c)) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(line) => {
+            if (line.len() == 0) {
+                return Result.Err("empty RESP response");
+            }
+            let t = line[0];
+            let rest = line.substring(1, line.len());
+            if (t == '+') {
+                Result.Ok(Reply.Str(rest))
+            } else {
+                if (t == '-') {
+                    Result.Ok(Reply.Err(rest))
+                } else {
+                    if (t == ':') {
+                        match (parse_len(rest)) {
+                            Result.Ok(n) => Result.Ok(Reply.Int(n)),
+                            Result.Err(e) => Result.Err(e),
+                        }
+                    } else {
+                        if (t == '$') {
+                            read_bulk(c, rest)
+                        } else {
+                            if (t == '*') {
+                                match (parse_len(rest)) {
+                                    Result.Err(e) => Result.Err(e),
+                                    Result.Ok(n) => {
+                                        if (n < 0) {
+                                            Result.Ok(Reply.Nil)
+                                        } else {
+                                            read_array(c, n)
+                                        }
+                                    },
+                                }
+                            } else {
+                                Result.Err("type RESP unknown: " + to_string(t))
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    }
+}
+
+// Lee un bulk string `$<len>`: valida la longitud (malformada/excesiva = Err), lee los octetos
+// exactos y consume el \r\n de cierre.
+fn read_bulk(c: Conn, rest: string) -> Result<Reply, string> {
+    let n = parse_len(rest)?;
+    if (n < 0) {
+        return Result.Ok(Reply.Nil);
+    }
+    if (n > max_bulk()) {
+        return Result.Err("RESP bulk exceeds the limit (" + to_string(n) + " bytes)");
+    }
+    let data = read_n(c, n)?;
+    // Consume el \r\n que cierra el bulk string.
+    match (read_line(c)) {
+        Result.Ok(_) => Result.Ok(Reply.Str(text(data))),
+        Result.Err(e) => Result.Err(e),
+    }
+}
+
+// Lee `n` respuestas seguidas como un array.
+fn read_array(c: Conn, n: int) -> Result<Reply, string> {
+    var items: [Reply] = [];
+    var i = 0;
+    var err = "";
+    while (i < n && err == "") {
+        match (read_reply(c)) {
+            Result.Ok(it) => items.push(it),
+            Result.Err(e) => {
+                err = e;
+            },
+        }
+        i = i + 1;
+    }
+    if (err != "") {
+        Result.Err(err)
+    } else {
+        Result.Ok(Reply.Arr(items))
+    }
+}
+
+// Envía un comando y lee su respuesta.
+/// Sends a command (e.g. `["SET", "k", "v"]`) and blocks reading its reply.
+/// Err = transport failure (send error, connection closed mid-reply) or a malformed reply;
+/// a server-side error arrives as `Ok(Reply.Err(msg))`, not as Err.
+pub fn command(c: Conn, args: [string]) -> Result<Reply, string> {
+    match (net.socket_write_bytes(c.h, encode_command(args))) {
+        Result.Err(e) => Result.Err("error sending: " + e),
+        Result.Ok(_) => read_reply(c),
+    }
+}
+
+// Representación legible de una respuesta (para depurar/mostrar).
+/// Human-readable rendering of a reply (for debugging/display):
+/// strings as-is, ints via to_string, `(nil)`, `(error) msg`, arrays as `[a, b, ...]`.
+pub fn reply_str(r: Reply) -> string {
+    match (r) {
+        Reply.Str(s) => s,
+        Reply.Int(n) => to_string(n),
+        Reply.Nil => "(nil)",
+        Reply.Err(e) => "(error) " + e,
+        Reply.Arr(items) => "[" + join_replies(items) + "]",
+    }
+}
+
+fn join_replies(items: [Reply]) -> string {
+    var s = "";
+    var i = 0;
+    while (i < items.len()) {
+        if (i > 0) {
+            s = s + ", ";
+        }
+        s = s + reply_str(items[i]);
+        i = i + 1;
+    }
+    s
+}

@@ -1,0 +1,91 @@
+// JWT con firma EdDSA/Ed25519 (RFC 8037 + RFC 7519), escrito EN raylang. Cierra M30: extiende los JWT
+// más allá del HMAC simétrico (HS256 de `jwt.ray`) con **firma asimétrica** — el que firma tiene el
+// seed privado, cualquiera verifica con la clave pública. Apila Ed25519 (std/crypto, ring) + base64url.
+// M60: la API habla `bytes` (seed/pubkey), como el resto de la pila de producción.
+//
+// Un JWT es `base64url(header) . base64url(payload) . base64url(firma)`, con la firma =
+// Ed25519(seed, "header.payload"). El header está fijo a `{"alg":"EdDSA","typ":"JWT"}`. El payload
+// (las *claims*) se pasa y se devuelve como string JSON crudo (como en HS256). Importable:
+//   from jwt_eddsa import jwt_eddsa_sign, jwt_eddsa_verify;
+from std/base64 import base64url, base64url_decode;
+from std/json import parse, Json;
+import std/crypto;
+
+// El header canónico de EdDSA, ya codificado en base64url.
+fn header_b64() -> string {
+    base64url("{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}".to_bytes())
+}
+
+// Firma las *claims* (JSON crudo) con el `seed` privado (32 octetos) y devuelve el JWT compacto `h.p.s`.
+/// Signs the claims (raw JSON string) with Ed25519 using the 32-byte private `seed` and
+/// returns the compact JWT `header.payload.signature` (RFC 8037, alg fixed to EdDSA).
+/// An invalid seed (wrong length) yields an empty signature segment (honest degradation).
+pub fn jwt_eddsa_sign(seed: bytes, payload_json: string) -> string {
+    let h = header_b64();
+    let p = base64url(payload_json.to_bytes());
+    let signing_input = h + "." + p;
+    // `ring` deriva la clave pública de la semilla al firmar (a diferencia del Ed25519 pedagógico de 3
+    // argumentos, que la recibía) → aquí no hace falta calcularla.
+    let sig = match (crypto.ed25519_sign(seed, signing_input.to_bytes())) {
+        Option.Some(x) => x,
+        Option.None => b"",
+    };
+    signing_input + "." + base64url(sig)
+}
+
+// Extrae el algoritmo declarado en el header (`alg`), decodificando base64url → UTF-8 → JSON y
+// exigiendo que `alg` sea una cadena. Sirve para RECHAZAR tokens de otro algoritmo (alg:none o un
+// HS256 colado) antes de dar por buena la firma: defensa en profundidad simétrica a la de HS256.
+fn header_alg(header_b64u: string) -> Result<string, string> {
+    let raw = base64url_decode(header_b64u)?;
+    let txt = from_utf8(raw)?;
+    let j = parse(txt)?;
+    match (j) {
+        Json.JObject(m) => match (m.get("alg")) {
+            Option.Some(v) => match (v) {
+                Json.JStr(a) => Result.Ok(a),
+                _ => Result.Err("'alg' is not a string"),
+            },
+            Option.None => Result.Err("missing 'alg'"),
+        },
+        _ => Result.Err("the header is not a JSON object"),
+    }
+}
+
+// Verifica un JWT EdDSA con la clave pública (32 octetos). `Ok(payload_json)` si la firma es válida,
+// `Err(motivo)` si no. NO comprueba `exp`/`nbf` (política de la aplicación sobre el JSON devuelto).
+/// Verifies an EdDSA JWT against the 32-byte Ed25519 public key and returns the decoded
+/// payload: `Ok(payload_json)` if the signature is valid; `Err(reason)` on malformed token,
+/// bad base64url, or invalid signature. Does NOT check `exp`/`nbf` — application policy.
+pub fn jwt_eddsa_verify(pubkey: bytes, token: string) -> Result<string, string> {
+    let parts = token.split(".");
+    if (parts.len() != 3) {
+        return Result.Err("malformed JWT: expected 3 segments");
+    }
+    // Defensa en profundidad: el header debe declarar EdDSA (rechaza alg:none / confusión de algoritmo).
+    match (header_alg(parts[0])) {
+        Result.Ok(a) => {
+            if (a != "EdDSA") {
+                return Result.Err("unsupported algorithm: expected EdDSA, the token declares " + a);
+            }
+        },
+        Result.Err(e) => {
+            return Result.Err("invalid JWT header: " + e);
+        },
+    }
+    let signing_input = parts[0] + "." + parts[1];
+    let sig = match (base64url_decode(parts[2])) {
+        Result.Ok(s) => s,
+        Result.Err(e) => {
+            return Result.Err(e);
+        },
+    };
+    if (!crypto.ed25519_verify(pubkey, signing_input.to_bytes(), sig)) {
+        return Result.Err("invalid signature");
+    }
+    // Firma válida: decodifica el payload (base64url → UTF-8).
+    match (base64url_decode(parts[1])) {
+        Result.Ok(payload) => from_utf8(payload),
+        Result.Err(e) => Result.Err(e),
+    }
+}

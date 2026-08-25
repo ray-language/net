@@ -1,0 +1,185 @@
+// Logging estructurado en JSON, escrito EN raylang. Cero runtime nuevo. Cada entrada es una línea JSON
+// con marca de tiempo, nivel, servicio, mensaje y campos estructurados → lista para que la recoja un
+// agregador (Loki, ELK, CloudWatch…). Importable:
+//   from log import logger, debug, info, warn, error, field, field_int, field_bool, emit, render;
+//
+// API encadenable por UFCS (cross-module): `info(lg, "login").field("user", "ada").field_int("n", 3).emit();`
+// Niveles: DEBUG=0, INFO=1, WARN=2, ERROR=3. El logger filtra por debajo de su `min_level`.
+from net/time import now_utc, to_iso8601;
+
+/// A structured JSON logger: a service name, a minimum level, and an optional trace id
+/// (M88.3: "" = none; set it with `with_trace` so every entry carries a `trace_id` field).
+/// Entries below `min_level` are discarded by `emit`. Levels: DEBUG=0, INFO=1, WARN=2, ERROR=3.
+pub struct Logger {
+    service: string,
+    min_level: int,
+    trace_id: string,
+}
+
+// Un campo estructurado: clave, valor ya formateado, y si va entre comillas (string) o crudo (número/bool).
+struct Field {
+    key: string,
+    value: string,
+    quoted: bool,
+}
+
+// Una entrada en construcción: el logger, el nivel, el mensaje y los campos acumulados.
+/// A log entry being built: logger, level, message and accumulated structured fields.
+/// Chain `field`/`field_int`/`field_bool` (UFCS) and finish with `emit` or `render`.
+pub struct LogEntry {
+    lg: Logger,
+    level: int,
+    msg: string,
+    fields: [Field],
+}
+
+/// Creates a logger for `service` with minimum level DEBUG (logs everything).
+pub fn logger(service: string) -> Logger {
+    Logger { service: service, min_level: 0, trace_id: "" }
+}
+
+// Logger con un nivel mínimo (descarta por debajo).
+/// Returns a copy of the logger with the given minimum level; `emit` drops entries below it.
+pub fn with_level(lg: Logger, min_level: int) -> Logger {
+    Logger { service: lg.service, min_level: min_level, trace_id: lg.trace_id }
+}
+
+// M88.3: correlación con el tracing distribuido. Un logger POR PETICIÓN (copia barata) con el
+// trace_id de `webserver.trace_of(req)` → cada línea de esa petición lleva el mismo trace_id y
+// el agregador las junta de punta a punta entre servicios.
+/// Returns a copy of the logger stamped with a trace id (from `webserver.trace_of(req)` /
+/// `trace.new_trace()`): every entry it emits carries a `trace_id` field, correlating all the
+/// logs of one request across services. Make one per request — copies are cheap.
+pub fn with_trace(lg: Logger, trace_id: string) -> Logger {
+    Logger { service: lg.service, min_level: lg.min_level, trace_id: trace_id }
+}
+
+fn at(lg: Logger, level: int, msg: string) -> LogEntry {
+    LogEntry { lg: lg, level: level, msg: msg, fields: [] }
+}
+
+/// Starts a DEBUG-level entry with message `msg` (add fields, then `emit`).
+pub fn debug(lg: Logger, msg: string) -> LogEntry { at(lg, 0, msg) }
+
+/// Starts an INFO-level entry with message `msg` (add fields, then `emit`).
+pub fn info(lg: Logger, msg: string) -> LogEntry { at(lg, 1, msg) }
+
+/// Starts a WARN-level entry with message `msg` (add fields, then `emit`).
+pub fn warn(lg: Logger, msg: string) -> LogEntry { at(lg, 2, msg) }
+
+/// Starts an ERROR-level entry with message `msg` (add fields, then `emit`).
+pub fn error(lg: Logger, msg: string) -> LogEntry { at(lg, 3, msg) }
+
+// Añade un campo string (encadenable). Muta la entrada por referencia y la devuelve.
+/// Appends a string field to the entry (rendered JSON-quoted). Mutates the entry
+/// by reference and returns it, so calls chain.
+pub fn field(e: LogEntry, key: string, value: string) -> LogEntry {
+    e.fields.push(Field { key: key, value: value, quoted: true });
+    e
+}
+
+/// Appends an integer field to the entry (rendered as a bare JSON number). Chainable.
+pub fn field_int(e: LogEntry, key: string, value: int) -> LogEntry {
+    e.fields.push(Field { key: key, value: to_string(value), quoted: false });
+    e
+}
+
+/// Appends a boolean field to the entry (rendered as a bare JSON true/false). Chainable.
+pub fn field_bool(e: LogEntry, key: string, value: bool) -> LogEntry {
+    e.fields.push(Field { key: key, value: to_string(value), quoted: false });
+    e
+}
+
+fn level_name(level: int) -> string {
+    if (level <= 0) { "DEBUG" } else {
+        if (level == 1) { "INFO" } else {
+            if (level == 2) { "WARN" } else { "ERROR" }
+        }
+    }
+}
+
+// Cuatro dígitos hex en minúscula de `n` (0..65535), para el escape \uXXXX.
+fn hex4(n: int) -> string {
+    let digs = "0123456789abcdef";
+    to_string(
+        digs[n >> 12 & 15]
+    ) + to_string(digs[n >> 8 & 15]) + to_string(digs[n >> 4 & 15]) + to_string(digs[n & 15])
+}
+
+// Escapa una cadena para incrustarla en JSON. M70: cubre TODO control < 0x20 (RFC 8259;
+// antes solo \n/\t/\r → un BEL/ESC/\x00 en el mensaje emitía JSON inválido y el agregador
+// rechazaba justo las entradas interesantes). Acumula partes + join (no `out + c`, O(n²)).
+fn json_escape(s: string) -> string {
+    let cs = s.chars();
+    var parts: [string] = [];
+    var i = 0;
+    while (i < cs.len()) {
+        let c = cs[i];
+        if (c == '"') {
+            parts.push("\\\"");
+        } else if (c == '\\') {
+            parts.push("\\\\");
+        } else if (c == '\n') {
+            parts.push("\\n");
+        } else if (c == '\t') {
+            parts.push("\\t");
+        } else if (c == '\r') {
+            parts.push("\\r");
+        } else {
+            let code = char_code(c);
+            if (code == 8) {
+                parts.push("\\b");
+            } else if (code == 12) {
+                parts.push("\\f");
+            } else if (code < 32) {
+                parts.push("\\u" + hex4(code));
+            } else {
+                parts.push(to_string(c));
+            }
+        }
+        i = i + 1;
+    }
+    join(parts, "")
+}
+
+// Renderiza la entrada como una línea JSON con la marca de tiempo `ts` dada (determinista → testeable).
+// El orden de claves es fijo: ts, level, service, [trace_id], msg, y luego los campos en orden de
+// adición. El trace_id (M88.3) solo aparece si el logger lo lleva (`with_trace`) — retrocompatible.
+/// Renders the entry as one JSON line using the given timestamp `ts` (deterministic, testable).
+/// Key order is fixed: ts, level, service, trace_id (only when set via `with_trace`), msg, then
+/// fields in insertion order; strings are escaped.
+pub fn render(e: LogEntry, ts: string) -> string {
+    // Igual que `json_escape`: acumula partes + join al final (no `out = out + ...` repetido,
+    // O(n²) — cada `+` de string es una asignación de heap nueva, no in-place).
+    var parts: [string] = [];
+    parts.push(
+        "{\"ts\":\"" + ts + "\",\"level\":\"" + level_name(e.level) + "\",\"service\":\"" + json_escape(e.lg.service) + "\""
+    );
+    if (e.lg.trace_id != "") {
+        parts.push(",\"trace_id\":\"" + json_escape(e.lg.trace_id) + "\"");
+    }
+    parts.push(",\"msg\":\"" + json_escape(e.msg) + "\"");
+    var i = 0;
+    while (i < e.fields.len()) {
+        let f = e.fields[i];
+        parts.push(",\"" + json_escape(f.key) + "\":");
+        if (f.quoted) {
+            parts.push("\"" + json_escape(f.value) + "\"");
+        } else {
+            parts.push(f.value);
+        }
+        i = i + 1;
+    }
+    parts.push("}");
+    join(parts, "")
+}
+
+// Emite la entrada (a stdout) si su nivel alcanza el mínimo del logger. La marca de tiempo es la actual
+// en UTC (ISO 8601). Para una salida determinista (tests), usa `render(e, ts)` con un `ts` fijo.
+/// Prints the entry as a JSON line to stdout if its level reaches the logger's minimum.
+/// The timestamp is the current UTC time in ISO 8601; use `render(e, ts)` for deterministic output.
+pub fn emit(e: LogEntry) {
+    if (e.level >= e.lg.min_level) {
+        print(render(e, to_iso8601(now_utc())));
+    }
+}

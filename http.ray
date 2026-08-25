@@ -1,0 +1,1309 @@
+// M15.4b — un cliente HTTP/1.1 escrito EN raylang, sobre los builtins TCP de M15.2.
+//
+// Igual que la librería JSON: cero runtime; puro raylang + stdlib, importable. Solo http:// (TLS
+// pediría criptografía → M19.4). Usa "Connection: close" y lee hasta EOF para delimitar el cuerpo.
+// Errores como valores (Result).
+//
+// M19.2: el cuerpo de la respuesta es **bytes** (octetos crudos intactos → descargas binarias
+// correctas, no solo texto). Las cabeceras siguen siendo texto (ASCII): se decodifican con from_utf8
+// para parsearlas. Para leer el cuerpo como texto, usa `body_text(r)`.
+// M20.10b: descompresión transparente de `Content-Encoding: gzip` (la librería INFLATE en raylang).
+// M58.2: robustez de red — plazo TOTAL de lectura (default 30 s; antes un servidor colgado
+// bloqueaba para siempre), `Host` con el puerto no-default (vhosts en :8080), `Accept-Encoding:
+// gzip` (activa de verdad el gunzip), cuerpo de petición en BYTES (subidas binarias; además el
+// Content-Length ahora cuenta OCTETOS — con string contaba caracteres y fallaba con no-ASCII) y
+// Content-Length de la respuesta verificado (truncada = Err, no un cuerpo a medias en silencio).
+// M90.2: conexiones persistentes (keep-alive) — `connect`/`conn_request*`/`conn_close` reusan un
+// socket entre peticiones delimitando cada respuesta por Content-Length/chunked (sin EOF), con
+// reconexión y reintento transparente si el servidor la cerró en el ocio.
+from std/inflate import gunzip_limit;
+import std/net;
+import std/time;
+import net/trace;
+
+/// An HTTP/1.1 response: status code, headers, and body.
+/// Header names are stored lowercased for case-insensitive lookup; the body is raw bytes
+/// (already de-chunked and gunzipped if the server used chunked transfer or gzip encoding).
+pub struct Response {
+    status: int,
+    headers: Map<string, string>,
+    body: bytes,
+}
+
+struct Url {
+    host: string,
+    port: int,
+    path: string,
+    tls: bool,
+}
+
+// Parsea "http://host[:port]/path" o "https://…" (puertos 80/443 por defecto). M19.4a: `https` usa TLS.
+fn parse_url(url: string) -> Result<Url, string> {
+    var rest: string = "";
+    var port: int = 80;
+    var tls: bool = false;
+    if (url.starts_with("https://")) {
+        rest = url.substring(8, url.len());
+        port = 443;
+        tls = true;
+    } else {
+        if (url.starts_with("http://")) {
+            rest = url.substring(7, url.len());
+        } else {
+            return Result.Err("only http:// or https:// is supported");
+        }
+    }
+
+    // Separar host[:port] de /path.
+    var hostport: string = rest;
+    var path: string = "/";
+    match (index_of(rest, "/")) {
+        Option.Some(idx) => {
+            hostport = rest.substring(0, idx);
+            path = rest.substring(idx, rest.len());
+        },
+        Option.None => { },
+    }
+
+    // Separar host de puerto (un ':' explícito gana al puerto por defecto del esquema).
+    var host: string = hostport;
+    match (index_of(hostport, ":")) {
+        Option.Some(idx) => {
+            host = hostport.substring(0, idx);
+            let ps: string = hostport.substring(idx + 1, hostport.len());
+            match (parse_int(ps)) {
+                Option.Some(n) => {
+                    port = n;
+                },
+                Option.None => {
+                    return Result.Err("invalid port: " + ps);
+                },
+            }
+        },
+        Option.None => { },
+    }
+    Result.Ok(Url { host: host, port: port, path: path, tls: tls })
+}
+
+// El valor de la cabecera `Host`: con el puerto cuando no es el default del esquema (RFC 9112;
+// un vhost en :8080 puede servir otra cosa sin él). M58.2 — el cliente WebSocket ya lo hacía.
+fn host_header(u: Url) -> string {
+    let default: int = if (u.tls) { 443 } else { 80 };
+    if (u.port == default) { u.host } else { u.host + ":" + to_string(u.port) }
+}
+
+// ¿Las cabeceras extra ya traen `nombre` (case-insensitive)? Para no pisar las del llamador.
+fn has_header(extra: Map<string, string>, name: string) -> bool {
+    let ks: [string] = extra.keys();
+    var i: int = 0;
+    while (i < ks.len()) {
+        if (ks[i].to_lower() == name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+// Cabeceras extra (nombre→valor). Las del cliente (Host/Connection/Content-Length/Accept-Encoding)
+// van primero; las extra se añaden tal cual (en orden de clave, determinista). El cuerpo va en
+// BYTES → el Content-Length cuenta OCTETOS (con string contaba caracteres: mal con no-ASCII).
+fn build_request_h(method: string, u: Url, body: bytes, extra: Map<string, string>) -> bytes {
+    build_request_conn(method, u, body, extra, "close")
+}
+
+// Como `build_request_h` pero con la cabecera `Connection` parametrizada: "close" para una
+// petición suelta, "keep-alive" para una conexión persistente (M90.2).
+fn build_request_conn(
+    method: string,
+    u: Url,
+    body: bytes,
+    extra: Map<string, string>,
+    conn_val: string
+) -> bytes {
+    var req: string = method + " " + u.path + " HTTP/1.1\r\n";
+    req = req + "Host: " + host_header(u) + "\r\n";
+    req = req + "Connection: " + conn_val + "\r\n";
+    // M58.2: anuncia gzip (el gunzip transparente existía desde M20.10b pero nunca se pedía).
+    if (!has_header(extra, "accept-encoding")) {
+        req = req + "Accept-Encoding: gzip\r\n";
+    }
+    if (body.len() > 0) {
+        req = req + "Content-Length: " + to_string(body.len()) + "\r\n";
+    }
+    let names: [string] = extra.keys();
+    var i: int = 0;
+    while (i < names.len()) {
+        let name: string = names[i];
+        match (get(extra, name)) {
+            Option.Some(value) => {
+                req = req + name + ": " + value + "\r\n";
+            },
+            Option.None => { },
+        }
+        i = i + 1;
+    }
+    req = req + "\r\n";
+    req.to_bytes() + body
+}
+
+// Una lectura respetando el plazo TOTAL (monotónico; 0 = sin plazo): antes de cada lectura se
+// fija el timeout del socket a lo que RESTA (M56.4/M58.2 — el goteo no renueva el plazo).
+fn read_with_deadline(h: int, deadline: int) -> Result<bytes, string> {
+    if (deadline > 0) {
+        let remaining: int = deadline - time.monotonic();
+        if (remaining <= 0) {
+            return Result.Err("read timeout");
+        }
+        net.set_read_timeout(h, remaining);
+    }
+    net.socket_read_bytes(h)
+}
+
+// Lee del socket hasta que el servidor cierra (o vence el plazo), acumulando bytes (binario intacto).
+fn read_all(h: int, deadline: int) -> Result<bytes, string> {
+    var acc: bytes = b"";
+    var follow: bool = true;
+    var err: string = "";
+    while (follow) {
+        match (read_with_deadline(h, deadline)) {
+            Result.Ok(trozo) => {
+                if (trozo.len() == 0) {
+                    follow = false;
+                } else {
+                    acc = acc + trozo;
+                }
+            },
+            Result.Err(e) => {
+                err = e;
+                follow = false;
+            },
+        }
+    }
+    if (err == "") { Result.Ok(acc) } else { Result.Err(err) }
+}
+
+// El índice del primer "\r\n\r\n" (fin de cabeceras) en bytes, o -1. Escanea por octetos (CR=13, LF=10);
+// no se puede usar index_of (es de string) porque el cuerpo binario rompería from_utf8 del buffer entero.
+fn find_fin_headers(b: bytes) -> int {
+    var i: int = 0;
+    while (i + 3 < b.len()) {
+        if (b[i] == 13 && b[i + 1] == 10 && b[i + 2] == 13 && b[i + 3] == 10) {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+// El índice del primer "\r\n" en bytes desde `from`, o -1. (Para el framing de transfer-encoding chunked.)
+fn find_crlf(b: bytes, start: int) -> int {
+    var i: int = start;
+    while (i + 1 < b.len()) {
+        if (b[i] == 13 && b[i + 1] == 10) {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+// Valor (0..15) de un octeto de dígito hexadecimal, o -1 si no lo es.
+fn hex_byte_val(o: int) -> int {
+    if (o >= 48 && o <= 57) {
+        o - 48
+    } else {
+        if (o >= 97 && o <= 102) {
+            o - 87  // 'a'..'f'
+        } else {
+            if (o >= 65 && o <= 70) {
+                o - 55  // 'A'..'F'
+            } else {
+                0 - 1
+            }
+        }
+    }
+}
+
+// Tamaño (decimal) de un chunk a partir de su línea hex `[start, end)`. Se detiene en `;` (extensiones)
+// o en el primer carácter no-hexadecimal (tolerante).
+fn parse_chunk_size(b: bytes, start: int, end: int) -> int {
+    var size: int = 0;
+    var i: int = start;
+    while (i < end) {
+        let o: int = b[i];
+        if (o == 59) {
+            // ';'
+            return size;
+        }
+        let v: int = hex_byte_val(o);
+        if (v < 0) {
+            return size;
+        }
+        size = size * 16 + v;
+        i = i + 1;
+    }
+    size
+}
+
+// Decodifica un cuerpo con Transfer-Encoding: chunked → los octetos crudos. Formato:
+// `<hex>\r\n<datos>\r\n` repetido, terminado por un chunk de tamaño 0.
+fn decode_chunked(body: bytes) -> Result<bytes, string> {
+    var out: bytes = b"";
+    var pos: int = 0;
+    let n: int = body.len();
+    var follow: bool = true;
+    while (follow && pos < n) {
+        let line_end: int = find_crlf(body, pos);
+        if (line_end < 0) {
+            return Result.Err("chunk without size CRLF");
+        }
+        let size: int = parse_chunk_size(body, pos, line_end);
+        pos = line_end + 2;
+        if (size <= 0) {
+            follow = false;  // chunk final (0)
+        } else {
+            if (pos + size > n) {
+                return Result.Err("truncated chunk");
+            }
+            out = out + body.sub_bytes(pos, pos + size);
+            pos = pos + size + 2;  // salta el \r\n tras los datos
+        }
+    }
+    Result.Ok(out)
+}
+
+// Parsea la CABEZA de una respuesta (línea de estado + cabeceras, SIN el "\r\n\r\n" final):
+// (status, cabeceras con nombre en minúsculas). Compartido por parse_response y el streaming (M108).
+fn parse_head(head: bytes) -> Result<(int, Map<string, string>), string> {
+    match (from_utf8(head)) {
+        Result.Err(e) => Result.Err("HTTP headers are not UTF-8: " + e),
+        Result.Ok(headers_raw) => {
+            let lines: [string] = headers_raw.split("\r\n");
+
+            // Línea de estado: "HTTP/1.1 200 OK".
+            let parts: [string] = lines[0].split(" ");
+            if (parts.len() < 2) {
+                return Result.Err("malformed status line: " + lines[0]);
+            }
+            var status: int = 0;
+            match (parse_int(parts[1])) {
+                Option.Some(n) => {
+                    status = n;
+                },
+                Option.None => {
+                    return Result.Err("invalid status code: " + parts[1]);
+                },
+            }
+
+            // Cabeceras: "Nombre: Valor" (nombre en minúsculas para lookup case-insensitive).
+            var headers: Map<string, string> = Map.new();
+            var i: int = 1;
+            while (i < lines.len()) {
+                let line: string = lines[i];
+                match (index_of(line, ":")) {
+                    Option.Some(c) => {
+                        let name: string = line.substring(0, c).trim().to_lower();
+                        let value: string = line.substring(c + 1, line.len()).trim();
+                        headers.insert(name, value);
+                    },
+                    Option.None => { },
+                }
+                i = i + 1;
+            }
+            Result.Ok((status, headers))
+        },
+    }
+}
+
+fn parse_response(raw: bytes) -> Result<Response, string> {
+    let sep: int = find_fin_headers(raw);
+    if (sep < 0) {
+        return Result.Err("malformed HTTP response (no header separator)");
+    }
+    // Cabeceras = texto (ASCII): se decodifican para parsearlas. Cuerpo = bytes crudos.
+    let body: bytes = raw.sub_bytes(sep + 4, raw.len());
+    match (parse_head(
+    raw.sub_bytes(0, sep)
+)) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(head) => {
+            let status: int = head.0;
+            let headers: Map<string, string> = head.1;
+            // Transfer-Encoding: chunked → decodificar el cuerpo (un cliente robusto lo soporta;
+            // algunos servidores siempre chunked aunque pidamos Connection: close).
+            var body_final: bytes = body;
+            match (get(headers, "transfer-encoding")) {
+                Option.Some(te) => {
+                    if (te.to_lower().contains("chunked")) {
+                        match (decode_chunked(body)) {
+                            Result.Ok(d) => {
+                                body_final = d;
+                            },
+                            Result.Err(e) => {
+                                return Result.Err(e);
+                            },
+                        }
+                    }
+                },
+                Option.None => { },
+            }
+            // M58.2: con Content-Length declarado (y sin chunked), verificar la longitud: menos
+            // octetos = respuesta truncada (el servidor cayó a mitad) → Err, no un cuerpo a
+            // medias en silencio; de más (basura tras el cierre) se recorta a lo declarado.
+            var was_chunked: bool = false;
+            match (get(headers, "transfer-encoding")) {
+                Option.Some(te2) => {
+                    was_chunked = te2.to_lower().contains("chunked");
+                },
+                Option.None => { },
+            }
+            if (!was_chunked) {
+                match (get(
+                headers,
+                "content-length"
+            )) {
+                    Option.Some(cl) => {
+                        match (parse_int(
+                        cl
+                    )) {
+                            Option.Some(n) => {
+                                if (body_final.len() < n) {
+                                    return Result.Err(
+                                        "truncated response: got " + to_string(body_final.len()) + " de " + to_string(n) + " bytes"
+                                    );
+                                }
+                                if (body_final.len() > n) {
+                                    body_final = body_final.sub_bytes(0, n);
+                                }
+                            },
+                            Option.None => { },
+                        }
+                    },
+                    Option.None => { },
+                }
+            }
+            // Content-Encoding: gzip → descomprimir el cuerpo (M20.10b; M64.2: tope de 64 MiB anti-bomba).
+            match (get(headers, "content-encoding")) {
+                Option.Some(ce) => {
+                    if (ce.to_lower().contains("gzip")) {
+                        match (gunzip_limit(body_final, 67108864)) {
+                            Result.Ok(d) => {
+                                body_final = d;
+                            },
+                            Result.Err(e) => {
+                                return Result.Err("gzip: " + e);
+                            },
+                        }
+                    }
+                },
+                Option.None => { },
+            }
+            Result.Ok(Response { status: status, headers: headers, body: body_final })
+        },
+    }
+}
+
+// Devuelve el valor de una cabecera por nombre (case-insensitive), o None.
+/// Returns the value of a response header by name (case-insensitive).
+/// Returns None if the header is not present.
+pub fn header(r: Response, name: string) -> Option<string> {
+    get(r.headers, name.to_lower())
+}
+
+// El cuerpo de la respuesta decodificado como texto UTF-8 (para respuestas de texto/JSON). Para datos
+// binarios, usa `r.body` (bytes) directamente.
+/// Decodes the response body as UTF-8 text (for text/JSON responses).
+/// Err if the body is not valid UTF-8; for binary data use `r.body` directly.
+pub fn body_text(r: Response) -> Result<string, string> {
+    from_utf8(r.body)
+}
+
+// Abre la conexión adecuada al esquema: TLS para https, TCP en claro para http (M19.4a).
+fn dial(u: Url) -> Result<int, string> {
+    if (u.tls) {
+        net.tls_connect(u.host, u.port)
+    } else {
+        net.tcp_connect(u.host, u.port)
+    }
+}
+
+/// Performs an HTTP/1.1 request with the given method, URL, and body (blocking network I/O).
+/// Supports http:// and https:// (TLS); uses "Connection: close" and reads until EOF, with a
+/// 30 s total read timeout. Err on invalid URL, connection failure, I/O error/timeout, or a
+/// malformed/truncated response.
+pub fn request(method: string, url: string, body: string) -> Result<Response, string> {
+    request_with(method, url, body, Map.new())
+}
+
+// Como `request` pero con cabeceras extra (Authorization, Accept, Content-Type, …).
+/// Like `request` but with extra headers (Authorization, Accept, Content-Type, ...).
+/// Client headers (Host/Connection/Content-Length/Accept-Encoding) are set first; extras are
+/// appended in key order. 30 s total read timeout.
+pub fn request_with(
+    method: string,
+    url: string,
+    body: string,
+    headers: Map<string, string>
+) -> Result<Response, string> {
+    request_bytes(method, url, body.to_bytes(), headers, 30000)
+}
+
+// M88.3: propagación del trace W3C. Cada salto viaja como un tramo HIJO (span_id fresco, mismo
+// trace_id): así el receptor distingue QUIÉN le llamó sin perder el hilo de punta a punta.
+/// Like `request_with`, but propagates the W3C trace context: sends a `traceparent` header with
+/// a fresh CHILD span of `t` (same `trace_id`, new `span_id`). Get `t` from
+/// `webserver.trace_of(req)` (adopt the incoming trace) or `trace.new_trace()` (start one).
+pub fn request_traced(
+    method: string,
+    url: string,
+    body: string,
+    headers: Map<string, string>,
+    t: trace.Trace
+) -> Result<Response, string> {
+    // Copia: los Map van por referencia y el `traceparent` no debe aparecer en el del llamador.
+    var h: Map<string, string> = Map.new();
+    for k in headers.keys() {
+        match (headers.get(k)) {
+            Option.Some(v) => {
+                h.insert(k, v);
+            },
+            Option.None => { },
+        }
+    }
+    h.insert("traceparent", trace.traceparent(trace.child(t)));
+    request_with(method, url, body, h)
+}
+
+/// A traced GET: `request_traced` with no body and no extra headers.
+pub fn fetch_traced(url: string, t: trace.Trace) -> Result<Response, string> {
+    request_traced("GET", url, "", Map.new(), t)
+}
+
+// La forma BASE (M58.2): cuerpo en bytes (subidas binarias; Content-Length en octetos) y plazo
+// total de lectura explícito en ms (<= 0 = sin plazo). Las demás formas delegan aquí.
+/// The base request form: raw `bytes` body (binary uploads; `Content-Length` counts octets) and
+/// an explicit total read-timeout in ms (`<= 0` = no timeout). `request`/`request_with` delegate
+/// here with a UTF-8 body and 30 s. Err on invalid URL, connect failure, I/O error/timeout, or a
+/// malformed/truncated response.
+pub fn request_bytes(
+    method: string,
+    url: string,
+    body: bytes,
+    headers: Map<string, string>,
+    timeout_millis: int
+) -> Result<Response, string> {
+    match (parse_url(
+    url
+)) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(u) => {
+            match (dial(
+            u
+        )) {
+                Result.Err(e) => Result.Err("could not connect: " + e),
+                Result.Ok(h) => {
+                    let deadline: int = if (timeout_millis > 0) { time.monotonic() + timeout_millis } else { 0 };
+                    match (net.socket_write_bytes(h, build_request_h(method, u, body, headers))) {
+                        Result.Err(e) => {
+                            close(h);
+                            Result.Err("error sending: " + e)
+                        },
+                        Result.Ok(_) => {
+                            let r = read_all(h, deadline);
+                            close(h);
+                            match (r) {
+                                Result.Err(e) => Result.Err("error reading: " + e),
+                                Result.Ok(raw) => parse_response(raw),
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// ¿Es `status` una redirección con cabecera Location (301/302/303/307/308)?
+fn is_redirect(status: int) -> bool {
+    status == 301 || status == 302 || status == 303 || status == 307 || status == 308
+}
+
+// GET que sigue redirecciones (hasta `max` saltos). Devuelve la respuesta final, o un Err si se
+// supera el límite (posible bucle) o falla una petición. La nueva URL sale de la cabecera `Location`.
+/// GET that follows redirects (301/302/303/307/308) up to `max` hops, resolving relative Locations.
+/// Returns the final response; Err if the hop limit is exceeded (possible loop) or a request fails.
+/// A redirect without a Location header is returned as-is.
+pub fn fetch_follow(url: string, max: int) -> Result<Response, string> {
+    var current: string = url;
+    var restantes: int = max;
+    while (true) {
+        match (fetch(current)) {
+            Result.Err(e) => {
+                return Result.Err(e);
+            },
+            Result.Ok(resp) => {
+                if (!is_redirect(resp.status)) {
+                    return Result.Ok(resp);
+                }
+                if (restantes <= 0) {
+                    return Result.Err("too many redirects");
+                }
+                match (header(resp, "location")) {
+                    Option.Some(loc) => {
+                        current = absolutize(current, loc);
+                    },
+                    Option.None => {
+                        return Result.Ok(resp);  // redirección sin Location: se devuelve
+                    },
+                }
+                restantes = restantes - 1;
+            },
+        }
+    }
+    Result.Err("unreachable")
+}
+
+// Resuelve una Location que puede ser absoluta (`http://…`) o relativa al host actual (`/otra`).
+// M58.2: una relativa SIN `/` inicial (rara; la RFC pide absolutas o absolute-path) se ancla a la
+// raíz — antes se concatenaba sin separador y salía una URL malformada.
+fn absolutize(base: string, loc: string) -> string {
+    if (loc.starts_with("http://") || loc.starts_with("https://")) {
+        loc
+    } else {
+        match (parse_url(base)) {
+            Result.Ok(u) => {
+                let scheme: string = if (u.tls) { "https://" } else { "http://" };
+                let port: string = ":" + to_string(u.port);
+                let path: string = if (loc.starts_with("/")) { loc } else { "/" + loc };
+                scheme + u.host + port + path
+            },
+            Result.Err(_) => loc,
+        }
+    }
+}
+
+// Atajo para una petición GET. Se llama `fetch` (no `get`) a propósito: `get` ya es el accesor de
+// Map en el prelude y raylang no tiene sobrecarga, así que un `fn get` lo taparía dentro de este
+// módulo —y `header` necesita el `get` de Map—.
+/// Shorthand for a GET request with an empty body (does not follow redirects).
+/// Err on invalid URL, connection failure, I/O error, or a malformed response.
+pub fn fetch(url: string) -> Result<Response, string> {
+    request("GET", url, "")
+}
+
+// ── Conexión persistente (keep-alive, M90.2) ─────────────────────────────────────────────
+//
+// Una petición suelta (`fetch`/`request*`) abre y cierra su conexión ("Connection: close",
+// lee hasta EOF). Para hablar MUCHAS veces con el mismo servidor (un cliente REST, un
+// worker), `Conn` mantiene el socket abierto entre peticiones y delimita cada respuesta por
+// Content-Length o chunked —sin EOF—, guardando los octetos sobrantes para la siguiente
+// (patrón `Rd` del RPC de M88.4). Si la conexión reutilizada estaba caída (el servidor la
+// cerró en el ocio sin entregar ningún octeto de respuesta: la carrera clásica del
+// keep-alive), se reconecta y reintenta UNA vez de forma transparente.
+/// A persistent HTTP/1.1 connection (keep-alive): reuses one socket across requests to the
+/// same server, delimiting each response by Content-Length or chunked encoding. Create it
+/// with `connect`, issue requests with `conn_request`/`conn_request_bytes`, and release it
+/// with `conn_close`. If the server closes between requests, the next request reconnects
+/// and retries once transparently.
+pub struct Conn {
+    h: int,
+    buf: bytes,
+    host: string,
+    port: int,
+    tls: bool,
+    open: bool,
+}
+
+/// Opens a persistent connection to the server of `base_url` (scheme + host[:port]; any
+/// path in the URL is ignored — each request carries its own).
+pub fn connect(base_url: string) -> Result<Conn, string> {
+    match (parse_url(base_url)) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(u) => {
+            match (dial(
+            u
+        )) {
+                Result.Err(e) => Result.Err("could not connect: " + e),
+                Result.Ok(h) => Result.Ok(
+                    Conn { h: h, buf: b"", host: u.host, port: u.port, tls: u.tls, open: true }
+                ),
+            }
+        },
+    }
+}
+
+/// Closes a persistent connection. Safe to call twice; the Conn stays usable — the next
+/// request reopens the socket.
+pub fn conn_close(c: Conn) {
+    if (c.open) {
+        close(c.h);
+    }
+    c.open = false;
+    c.buf = b"";
+}
+
+// Reabre el socket de una Conn cerrada (reconexión perezosa).
+fn conn_reopen(c: Conn) -> Result<int, string> {
+    match (dial(Url { host: c.host, port: c.port, path: "/", tls: c.tls })) {
+        Result.Err(e) => Result.Err("could not connect: " + e),
+        Result.Ok(h) => {
+            c.h = h;
+            c.buf = b"";
+            c.open = true;
+            Result.Ok(0)
+        },
+    }
+}
+
+/// Like `request_with` but over a persistent connection: `path` is relative to the Conn's
+/// server (e.g. "/api/v1/users"). 30 s total read timeout.
+pub fn conn_request(
+    c: Conn,
+    method: string,
+    path: string,
+    body: string,
+    headers: Map<string, string>
+) -> Result<Response, string> {
+    conn_request_bytes(c, method, path, body.to_bytes(), headers, 30000)
+}
+
+// El marcador de "la conexión reutilizada estaba caída" (el servidor la cerró en el ocio,
+// sin entregar ningún octeto): dispara el reintento transparente sobre una conexión fresca.
+fn err_dropped() -> string {
+    "the persistent connection closed"
+}
+
+/// The base form over a persistent connection: raw bytes body and an explicit total
+/// read-timeout in ms (`<= 0` = no timeout). If the reused connection turns out dead — the
+/// server closed it while idle, before delivering any response byte — it reconnects and
+/// retries ONCE transparently.
+pub fn conn_request_bytes(
+    c: Conn,
+    method: string,
+    path: string,
+    body: bytes,
+    headers: Map<string, string>,
+    timeout_millis: int
+) -> Result<Response, string> {
+    let reused: bool = c.open;
+    match (conn_attempt(c, method, path, body, headers, timeout_millis)) {
+        Result.Ok(r) => Result.Ok(r),
+        Result.Err(e) => {
+            if (reused && e == err_dropped()) {
+                conn_close(c);
+                conn_attempt(c, method, path, body, headers, timeout_millis)
+            } else {
+                Result.Err(e)
+            }
+        },
+    }
+}
+
+// Un intento de petición sobre la conexión (sin reintento): asegura el socket, escribe la
+// request y lee UNA respuesta delimitada. Honra un `Connection: close` de la respuesta.
+fn conn_attempt(
+    c: Conn,
+    method: string,
+    path: string,
+    body: bytes,
+    headers: Map<string, string>,
+    timeout_millis: int
+) -> Result<Response, string> {
+    if (!c.open) {
+        let _ = conn_reopen(c)?;
+    }
+    let u = Url { host: c.host, port: c.port, path: path, tls: c.tls };
+    let deadline: int = if (timeout_millis > 0) { time.monotonic() + timeout_millis } else { 0 };
+    match (net.socket_write_bytes(
+    c.h,
+    build_request_conn(method, u, body, headers, "keep-alive")
+)) {
+        Result.Err(_) => {
+            // Escribir en una conexión que el servidor ya cerró falla aquí o en la lectura.
+            conn_close(c);
+            Result.Err(err_dropped())
+        },
+        Result.Ok(_) => {
+            match (conn_read_response(c, method, deadline)) {
+                Result.Err(e) => Result.Err(e),
+                Result.Ok(raw) => {
+                    match (parse_response(raw)) {
+                        Result.Err(e) => Result.Err(e),
+                        Result.Ok(r) => {
+                            // El servidor puede pedir cerrar tras esta respuesta.
+                            var close: bool = false;
+                            match (header(r, "connection")) {
+                                Option.Some(v) => {
+                                    close = v.to_lower().contains("close");
+                                },
+                                Option.None => { },
+                            }
+                            if (close) {
+                                conn_close(c);
+                            }
+                            Result.Ok(r)
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// Lee un trozo más del socket a `c.buf`. Ok(false) = EOF (el servidor cerró su lado).
+fn conn_read_more(c: Conn, deadline: int) -> Result<bool, string> {
+    match (read_with_deadline(c.h, deadline)) {
+        Result.Err(e) => {
+            conn_close(c);
+            Result.Err("error reading: " + e)
+        },
+        Result.Ok(trozo) => {
+            if (trozo.len() == 0) {
+                Result.Ok(false)
+            } else {
+                c.buf = c.buf + trozo;
+                Result.Ok(true)
+            }
+        },
+    }
+}
+
+// Asegura que `c.buf` tenga al menos `n` octetos (leyendo del socket lo que falte).
+fn conn_ensure(c: Conn, n: int, deadline: int) -> Result<int, string> {
+    while (c.buf.len() < n) {
+        match (conn_read_more(c, deadline)) {
+            Result.Err(e) => {
+                return Result.Err(e);
+            },
+            Result.Ok(mas) => {
+                if (!mas) {
+                    conn_close(c);
+                    return Result.Err("error reading: incomplete response");
+                }
+            },
+        }
+    }
+    Result.Ok(0)
+}
+
+// Saca los primeros `n` octetos de `c.buf` (la respuesta completa) dejando el resto en el
+// buffer (pertenecen a la SIGUIENTE respuesta).
+fn take(c: Conn, n: int) -> bytes {
+    let r: bytes = c.buf.sub_bytes(0, n);
+    c.buf = c.buf.sub_bytes(n, c.buf.len());
+    r
+}
+
+// Lee UNA respuesta completa y delimitada: cabeceras enteras y cuerpo por Content-Length /
+// chunked / sin-cuerpo (HEAD, 1xx, 204, 304, RFC 9112). Sin longitud declarada, cae a leer
+// hasta EOF (delimitación de una petición suelta) y la conexión deja de ser reutilizable.
+fn conn_read_response(c: Conn, method: string, deadline: int) -> Result<bytes, string> {
+    // 1. Cabeceras completas ("\r\n\r\n").
+    var sep: int = find_fin_headers(c.buf);
+    while (sep < 0) {
+        let had: int = c.buf.len();
+        match (conn_read_more(
+            c,
+            deadline
+        )) {
+            Result.Err(e) => {
+                return Result.Err(e);
+            },
+            Result.Ok(mas) => {
+                if (!mas) {
+                    // EOF antes de completar las cabeceras. Si no había llegado NADA, es la
+                    // carrera del keep-alive ocioso → reintentable; si llegó algo, truncada.
+                    conn_close(c);
+                    return if (had == 0) { Result.Err(err_dropped()) } else { Result.Err("error reading: incomplete response") };
+                }
+            },
+        }
+        sep = find_fin_headers(c.buf);
+    }
+    let fin_cab: int = sep + 4;
+
+    // 2. Decidir la delimitación del cuerpo con las cabeceras ya recibidas.
+    match (from_utf8(
+    c.buf.sub_bytes(0, sep)
+)) {
+        Result.Err(e) => Result.Err("HTTP headers are not UTF-8: " + e),
+        Result.Ok(cab) => {
+            let lines: [string] = cab.split("\r\n");
+            var status: int = 0;
+            let parts: [string] = lines[0].split(" ");
+            if (parts.len() >= 2) {
+                match (parse_int(parts[1])) {
+                    Option.Some(n) => {
+                        status = n;
+                    },
+                    Option.None => { },
+                }
+            }
+            var chunked: bool = false;
+            var content_len: int = 0 - 1;
+            var i: int = 1;
+            while (i < lines.len()) {
+                let lin: string = lines[i].to_lower();
+                if (lin.starts_with("transfer-encoding:")) {
+                    chunked = lin.contains("chunked");
+                }
+                if (lin.starts_with("content-length:")) {
+                    match (parse_int(lines[i].substring(15, lines[i].len()).trim())) {
+                        Option.Some(n) => {
+                            content_len = n;
+                        },
+                        Option.None => { },
+                    }
+                }
+                i = i + 1;
+            }
+            // Sin cuerpo por definición (RFC 9112 §6.3): HEAD, 1xx, 204 y 304.
+            if (method == "HEAD" || status == 204 || status == 304 || status >= 100 && status < 200) {
+                return Result.Ok(take(c, fin_cab));
+            }
+            if (chunked) {
+                return conn_read_chunked(c, fin_cab, deadline);
+            }
+            if (content_len >= 0) {
+                let _ = conn_ensure(c, fin_cab + content_len, deadline)?;
+                return Result.Ok(take(c, fin_cab + content_len));
+            }
+            // Sin longitud declarada: el EOF delimita, y la conexión no se puede reusar.
+            var follow: bool = true;
+            while (follow) {
+                match (conn_read_more(c, deadline)) {
+                    Result.Err(e) => {
+                        return Result.Err(e);
+                    },
+                    Result.Ok(mas) => {
+                        follow = mas;
+                    },
+                }
+            }
+            let todo: bytes = c.buf;
+            conn_close(c);
+            Result.Ok(todo)
+        },
+    }
+}
+
+// Delimita un cuerpo chunked leyendo del socket lo que falte: recorre chunk a chunk desde
+// `desde` hasta el chunk 0 y su línea vacía final (tolerando trailers). Devuelve la
+// respuesta cruda (cabeceras + cuerpo chunked intacto; `parse_response` lo decodifica).
+fn conn_read_chunked(c: Conn, start: int, deadline: int) -> Result<bytes, string> {
+    var pos: int = start;
+    while (true) {
+        // La línea hex de tamaño del chunk.
+        var line_end: int = find_crlf(c.buf, pos);
+        while (line_end < 0) {
+            let _ = conn_ensure(c, c.buf.len() + 1, deadline)?;
+            line_end = find_crlf(c.buf, pos);
+        }
+        let size: int = parse_chunk_size(c.buf, pos, line_end);
+        pos = line_end + 2;
+        if (size <= 0) {
+            // Chunk final: consumir trailers (raros) hasta la línea vacía.
+            while (true) {
+                var te: int = find_crlf(c.buf, pos);
+                while (te < 0) {
+                    let _ = conn_ensure(c, c.buf.len() + 1, deadline)?;
+                    te = find_crlf(c.buf, pos);
+                }
+                if (te == pos) {
+                    return Result.Ok(take(c, pos + 2));  // línea vacía: fin de la respuesta
+                }
+                pos = te + 2;
+            }
+        }
+        let _ = conn_ensure(c, pos + size + 2, deadline)?;
+        pos = pos + size + 2;  // datos + su \r\n
+    }
+    Result.Err("unreachable")
+}
+
+// =====================================================================
+// M108 — respuesta en STREAMING: cabeceras ya, cuerpo a trozos según llegan.
+// =====================================================================
+//
+// El caso que lo motiva: consumir una respuesta que se genera en vivo (tokens de un LLM, logs,
+// SSE) pintando cada trozo al llegar — `request` espera el cuerpo ENTERO. `stream` devuelve el
+// estado y las cabeceras en cuanto llegan; `stream_read` entrega el siguiente trozo del cuerpo
+// (des-chunkeado de forma incremental) aparcando solo la fibra.
+//
+// Decisiones: la petición NO anuncia gzip (no hay gunzip incremental; si el servidor lo impone
+// igualmente, error limpio). Socket de un solo uso (`Connection: close`): un stream no se reusa.
+// El plazo es de OCIO por lectura (un stream legítimo puede durar minutos; lo que delata el
+// problema es el silencio), no total.
+
+/// A streaming HTTP response: `status`/`headers` are available immediately; the body is pulled
+/// piece by piece with `stream_read`. Fields `mode`/`remaining`/`buf` are internal state.
+pub struct Stream {
+    h: int,
+    buf: bytes,
+    status: int,
+    headers: Map<string, string>,
+    // "size" | "data" | "crlf" | "trailer" (chunked) · "length" · "eof" · "done"
+    mode: string,
+    // en "data": octetos que quedan del chunk; en "length": octetos que quedan del cuerpo
+    remaining: int,
+    idle_ms: int,
+    open: bool,
+}
+
+/// Opens a streaming request with a 30 s idle timeout per read (see `stream_with`).
+pub fn stream(
+    method: string,
+    url: string,
+    body: bytes,
+    headers: Map<string, string>
+) -> Result<Stream, string> {
+    stream_with(method, url, body, headers, 30000)
+}
+
+/// Opens a streaming request: connects, sends, reads the head, and returns as soon as the
+/// status and headers are in — the body is pulled with `stream_read`. `idle_timeout_ms` bounds
+/// each individual read (a healthy stream may last minutes; silence is what signals trouble);
+/// `<= 0` = no timeout. The request does not advertise gzip (no incremental gunzip).
+pub fn stream_with(
+    method: string,
+    url: string,
+    body: bytes,
+    headers: Map<string, string>,
+    idle_timeout_ms: int
+) -> Result<Stream, string> {
+    match (parse_url(url)) {
+        Result.Err(e) => Result.Err(e),
+        Result.Ok(u) => {
+            match (dial(u)) {
+                Result.Err(e) => Result.Err("could not connect: " + e),
+                Result.Ok(h) => {
+                    // Copia de las cabeceras del llamador + identity (que el servidor no comprima):
+                    // el Map es compartido por referencia y no se muta lo que nos prestaron.
+                    var hs: Map<string, string> = Map.new();
+                    let names: [string] = headers.keys();
+                    var i: int = 0;
+                    while (i < names.len()) {
+                        match (get(headers, names[i])) {
+                            Option.Some(v) => {
+                                hs.insert(names[i], v);
+                            },
+                            Option.None => { },
+                        }
+                        i = i + 1;
+                    }
+                    if (!has_header(hs, "accept-encoding")) {
+                        hs.insert("Accept-Encoding", "identity");
+                    }
+                    let s = Stream {
+                        h: h,
+                        buf: b"",
+                        status: 0,
+                        headers: Map.new(),
+                        mode: "eof",
+                        remaining: 0,
+                        idle_ms: idle_timeout_ms,
+                        open: true
+                    };
+                    match (net.socket_write_bytes(
+                    h,
+                    build_request_conn(method, u, body, hs, "close")
+                )) {
+                        Result.Err(e) => {
+                            stream_close(s);
+                            Result.Err("error sending: " + e)
+                        },
+                        Result.Ok(_) => stream_head(s, method),
+                    }
+                },
+            }
+        },
+    }
+}
+
+// Lee hasta tener la cabeza completa, la parsea y fija el modo de delimitación del cuerpo.
+fn stream_head(s: Stream, method: string) -> Result<Stream, string> {
+    var sep: int = find_fin_headers(s.buf);
+    while (sep < 0) {
+        match (stream_fill(s)) {
+            Result.Err(e) => {
+                return Result.Err(e);
+            },
+            Result.Ok(more) => {
+                if (!more) {
+                    stream_close(s);
+                    return Result.Err("malformed HTTP response (no header separator)");
+                }
+            },
+        }
+        sep = find_fin_headers(s.buf);
+    }
+    match (parse_head(s.buf.sub_bytes(0, sep))) {
+        Result.Err(e) => {
+            stream_close(s);
+            Result.Err(e)
+        },
+        Result.Ok(head) => {
+            s.status = head.0;
+            s.headers = head.1;
+            s.buf = s.buf.sub_bytes(sep + 4, s.buf.len());
+            // Un cuerpo comprimido no se puede entregar a trozos (no hay gunzip incremental):
+            // solo puede pasar si el servidor ignora nuestro Accept-Encoding: identity.
+            match (get(s.headers, "content-encoding")) {
+                Option.Some(enc) => {
+                    if (enc.to_lower() != "identity") {
+                        stream_close(s);
+                        return Result.Err("streaming does not support content-encoding: " + enc);
+                    }
+                },
+                Option.None => { },
+            }
+            // Delimitación (las mismas reglas que conn_leer_respuesta, RFC 9112): sin cuerpo →
+            // hecho; chunked → framing incremental; Content-Length → cuenta atrás; si no → EOF.
+            if (method == "HEAD" || s.status < 200 || s.status == 204 || s.status == 304) {
+                stream_close(s);
+                s.mode = "done";
+                return Result.Ok(s);
+            }
+            var chunked: bool = false;
+            match (get(s.headers, "transfer-encoding")) {
+                Option.Some(te) => {
+                    chunked = te.to_lower().contains("chunked");
+                },
+                Option.None => { },
+            }
+            if (chunked) {
+                s.mode = "size";
+                return Result.Ok(s);
+            }
+            match (get(s.headers, "content-length")) {
+                Option.Some(cl) => {
+                    match (parse_int(cl)) {
+                        Option.Some(n) => {
+                            s.remaining = n;
+                            s.mode = "length";
+                            if (n == 0) {
+                                stream_close(s);
+                                s.mode = "done";
+                            }
+                        },
+                        Option.None => {
+                            stream_close(s);
+                            return Result.Err("invalid content-length: " + cl);
+                        },
+                    }
+                },
+                Option.None => {
+                    s.mode = "eof";
+                },
+            }
+            Result.Ok(s)
+        },
+    }
+}
+
+// Una lectura del socket al buffer, con el plazo de OCIO. Ok(false) = EOF.
+fn stream_fill(s: Stream) -> Result<bool, string> {
+    let deadline: int = if (s.idle_ms > 0) { time.monotonic() + s.idle_ms } else { 0 };
+    match (read_with_deadline(s.h, deadline)) {
+        Result.Err(e) => {
+            stream_close(s);
+            Result.Err("error reading: " + e)
+        },
+        Result.Ok(piece) => {
+            if (piece.len() == 0) {
+                Result.Ok(false)
+            } else {
+                s.buf = s.buf + piece;
+                Result.Ok(true)
+            }
+        },
+    }
+}
+
+// Saca hasta n octetos del frente del buffer.
+fn stream_take(s: Stream, n: int) -> bytes {
+    let k: int = if (n < s.buf.len()) { n } else { s.buf.len() };
+    let r: bytes = s.buf.sub_bytes(0, k);
+    s.buf = s.buf.sub_bytes(k, s.buf.len());
+    r
+}
+
+/// Pulls the next piece of the body: `Ok(Some(bytes))` as soon as ANY data is available
+/// (partial chunks included — that is the point), `Ok(None)` on a clean end of stream, `Err`
+/// on network/framing errors or a truncated body. Blocks only the calling fiber.
+pub fn stream_read(s: Stream) -> Result<Option<bytes>, string> {
+    while (true) {
+        if (s.mode == "done") {
+            return Result.Ok(Option.None);
+        }
+        if (s.mode == "length") {
+            if (s.remaining == 0) {
+                stream_close(s);
+                s.mode = "done";
+                return Result.Ok(Option.None);
+            }
+            if (s.buf.len() == 0) {
+                match (stream_fill(s)) {
+                    Result.Err(e) => {
+                        return Result.Err(e);
+                    },
+                    Result.Ok(more) => {
+                        if (!more) {
+                            stream_close(s);
+                            s.mode = "done";
+                            return Result.Err(
+                                "truncated body: " + to_string(s.remaining) + " bytes missing"
+                            );
+                        }
+                    },
+                }
+            }
+            let piece: bytes = stream_take(s, s.remaining);
+            s.remaining = s.remaining - piece.len();
+            return Result.Ok(Option.Some(piece));
+        }
+        if (s.mode == "eof") {
+            if (s.buf.len() > 0) {
+                return Result.Ok(Option.Some(stream_take(s, s.buf.len())));
+            }
+            match (stream_fill(s)) {
+                Result.Err(e) => {
+                    return Result.Err(e);
+                },
+                Result.Ok(more) => {
+                    if (!more) {
+                        stream_close(s);
+                        s.mode = "done";
+                        return Result.Ok(Option.None);
+                    }
+                },
+            }
+        }
+        if (s.mode == "data") {
+            if (s.buf.len() == 0) {
+                match (stream_fill(s)) {
+                    Result.Err(e) => {
+                        return Result.Err(e);
+                    },
+                    Result.Ok(more) => {
+                        if (!more) {
+                            stream_close(s);
+                            s.mode = "done";
+                            return Result.Err("truncated chunked body");
+                        }
+                    },
+                }
+            }
+            let piece: bytes = stream_take(s, s.remaining);
+            s.remaining = s.remaining - piece.len();
+            if (s.remaining == 0) {
+                s.mode = "crlf";
+            }
+            return Result.Ok(Option.Some(piece));
+        }
+        if (s.mode == "crlf") {
+            // El \r\n que cierra cada chunk.
+            if (stream_need(s, 2)?) {
+                if (s.buf[0] != 13 || s.buf[1] != 10) {
+                    stream_close(s);
+                    s.mode = "done";
+                    return Result.Err("malformed chunked body (missing chunk CRLF)");
+                }
+                s.buf = s.buf.sub_bytes(2, s.buf.len());
+                s.mode = "size";
+            } else {
+                stream_close(s);
+                s.mode = "done";
+                return Result.Err("truncated chunked body");
+            }
+        }
+        if (s.mode == "size") {
+            // Línea "tamaño-hex[;ext]\r\n".
+            var nl: int = find_crlf(s.buf, 0);
+            while (nl < 0) {
+                match (stream_fill(s)) {
+                    Result.Err(e) => {
+                        return Result.Err(e);
+                    },
+                    Result.Ok(more) => {
+                        if (!more) {
+                            stream_close(s);
+                            s.mode = "done";
+                            return Result.Err("truncated chunked body");
+                        }
+                    },
+                }
+                nl = find_crlf(s.buf, 0);
+            }
+            let size: int = parse_chunk_size(s.buf, 0, nl);
+            if (size < 0) {
+                stream_close(s);
+                s.mode = "done";
+                return Result.Err("malformed chunked body (bad chunk size)");
+            }
+            s.buf = s.buf.sub_bytes(nl + 2, s.buf.len());
+            if (size == 0) {
+                s.mode = "trailer";
+            } else {
+                s.remaining = size;
+                s.mode = "data";
+            }
+        }
+        if (s.mode == "trailer") {
+            // Tras el chunk 0: líneas de trailer hasta la vacía (lo normal: vacía directa).
+            var nl2: int = find_crlf(s.buf, 0);
+            while (nl2 >= 0) {
+                let line_len: int = nl2;
+                s.buf = s.buf.sub_bytes(nl2 + 2, s.buf.len());
+                if (line_len == 0) {
+                    stream_close(s);
+                    s.mode = "done";
+                    return Result.Ok(Option.None);
+                }
+                nl2 = find_crlf(s.buf, 0);
+            }
+            match (stream_fill(s)) {
+                Result.Err(e) => {
+                    return Result.Err(e);
+                },
+                Result.Ok(more) => {
+                    if (!more) {
+                        // EOF sin la línea en blanco del trailer: el cuerpo YA está completo
+                        // (llegó el chunk 0) → fin limpio, con lenidad.
+                        stream_close(s);
+                        s.mode = "done";
+                        return Result.Ok(Option.None);
+                    }
+                },
+            }
+        }
+    }
+    Result.Err("unreachable")
+}
+
+// Asegura n octetos en el buffer; Ok(false) = EOF antes de tenerlos.
+fn stream_need(s: Stream, n: int) -> Result<bool, string> {
+    while (s.buf.len() < n) {
+        match (stream_fill(s)) {
+            Result.Err(e) => {
+                return Result.Err(e);
+            },
+            Result.Ok(more) => {
+                if (!more) {
+                    return Result.Ok(false);
+                }
+            },
+        }
+    }
+    Result.Ok(true)
+}
+
+/// Closes a stream early (e.g. the consumer has seen enough). Safe to call twice; after a
+/// clean `Ok(None)` from `stream_read` it is already closed.
+pub fn stream_close(s: Stream) {
+    if (s.open) {
+        close(s.h);
+    }
+    s.open = false;
+}

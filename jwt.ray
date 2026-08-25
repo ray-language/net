@@ -1,0 +1,152 @@
+// JSON Web Tokens (RFC 7519) con firma HS256, escritos EN raylang. Cero runtime nuevo: apila
+// HMAC-SHA256 (`hmac.ray`) + base64url (`base64.ray`) + `bytes`. Importable:
+//   from jwt import jwt_sign, jwt_verify;
+//
+// Un JWT es `base64url(header) . base64url(payload) . base64url(firma)`, donde la firma es
+// HMAC-SHA256(secreto, "header.payload"). El header está fijo a HS256. El payload (las *claims*)
+// se pasa y se devuelve como **string JSON** crudo: raylang es estáticamente tipado y las claims son
+// heterogéneas → dejar el JSON al usuario (que puede armarlo con la librería `json`) es lo idiomático.
+from std/base64 import base64url, base64url_decode;
+from std/json import parse, Json;
+import std/crypto;
+
+// El header canónico de HS256, ya codificado en base64url (constante).
+fn header_b64() -> string {
+    base64url("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".to_bytes())
+}
+
+// La firma base64url de un "header.payload" dado, con el secreto.
+fn sign_input(secret: bytes, signing_input: string) -> string {
+    base64url(crypto.hmac_sha256(secret, signing_input.to_bytes()))
+}
+
+// Firma las *claims* (JSON crudo) y devuelve el JWT compacto `h.p.s`.
+/// Signs the claims (raw JSON string) with HMAC-SHA256 and returns the compact JWT
+/// `header.payload.signature` (RFC 7519, alg fixed to HS256).
+pub fn jwt_sign(secret: bytes, payload_json: string) -> string {
+    let h = header_b64();
+    let p = base64url(payload_json.to_bytes());
+    let signing_input = h + "." + p;
+    let s = sign_input(secret, signing_input);
+    signing_input + "." + s
+}
+
+// Comparación de strings en tiempo (casi) constante: recorre SIEMPRE toda la longitud, acumulando
+// las diferencias, para no filtrar por el momento del primer byte distinto (mitiga timing attacks).
+fn const_eq(a: string, b: string) -> bool {
+    if (a.len() != b.len()) {
+        return false;
+    }
+    var diff = 0;
+    var i = 0;
+    while (i < a.len()) {
+        if (a[i] != b[i]) {
+            diff = diff + 1;
+        }
+        i = i + 1;
+    }
+    diff == 0
+}
+
+// Extrae el algoritmo declarado en el header (`alg`), decodificando base64url → UTF-8 → JSON y
+// exigiendo que `alg` sea una cadena. Sirve para RECHAZAR tokens de otro algoritmo antes de dar por
+// buena la firma: aunque este verificador ya recomputa siempre con HS256 (un `alg:none` o un token
+// de otro algoritmo fallan la comparación), validar `alg` explícitamente es defensa en profundidad —
+// evita que el token cruce propósito y protege ante un refactor que leyera el `alg` del header.
+fn header_alg(header_b64u: string) -> Result<string, string> {
+    let raw = base64url_decode(header_b64u)?;
+    let txt = from_utf8(raw)?;
+    let j = parse(txt)?;
+    match (j) {
+        Json.JObject(m) => match (m.get("alg")) {
+            Option.Some(v) => match (v) {
+                Json.JStr(a) => Result.Ok(a),
+                _ => Result.Err("'alg' is not a string"),
+            },
+            Option.None => Result.Err("missing 'alg'"),
+        },
+        _ => Result.Err("the header is not a JSON object"),
+    }
+}
+
+// Verifica la firma de un JWT con el secreto. `Ok(payload_json)` si es válida, `Err(motivo)` si no
+// (formato incorrecto, firma que no cuadra, o payload no-UTF-8). NO comprueba `exp`/`nbf` (eso es
+// política de la aplicación, sobre el JSON ya devuelto — necesita la librería de tiempo, M20.5).
+/// Verifies an HS256 JWT's signature (constant-time comparison) and returns the decoded
+/// payload: `Ok(payload_json)` if valid; `Err(reason)` on malformed token, bad signature,
+/// or non-UTF-8 payload. Does NOT check `exp`/`nbf` claims — that is application policy.
+pub fn jwt_verify(secret: bytes, token: string) -> Result<string, string> {
+    let parts = token.split(".");
+    if (parts.len() != 3) {
+        return Result.Err("malformed JWT: expected 3 segments");
+    }
+    let h = parts[0];
+    let p = parts[1];
+    let signature = parts[2];
+    // Defensa en profundidad: el header debe declarar HS256 (rechaza alg:none / confusión de algoritmo).
+    match (header_alg(h)) {
+        Result.Ok(a) => {
+            if (a != "HS256") {
+                return Result.Err("unsupported algorithm: expected HS256, the token declares " + a);
+            }
+        },
+        Result.Err(e) => {
+            return Result.Err("invalid JWT header: " + e);
+        },
+    }
+    let expected_val = sign_input(secret, h + "." + p);
+    if (!const_eq(signature, expected_val)) {
+        return Result.Err("invalid signature");
+    }
+    // Firma válida: decodifica el payload (base64url → octetos → UTF-8).
+    match (base64url_decode(p)) {
+        Result.Ok(payload) => from_utf8(payload),
+        Result.Err(e) => Result.Err(e),
+    }
+}
+
+// Lee una claim numérica del payload (segundos UNIX, como manda la RFC). `None` si no está
+// o no es número.
+fn claim_seconds(m: Map<string, Json>, name: string) -> Option<int> {
+    match (m.get(name)) {
+        Option.Some(v) => match (v) {
+            Json.JNum(f) => Option.Some(f as int),
+            _ => Option.None,
+        },
+        Option.None => Option.None,
+    }
+}
+
+// M128: verifica firma Y claims temporales en una llamada — el patrón que toda app repetía a
+// mano. `exp`/`nbf` van en SEGUNDOS UNIX (RFC 7519); `now_ms` en milisegundos (time.now()).
+/// Verifies the JWT's signature (like `jwt_verify`) AND its time claims: rejects an expired
+/// token (`now >= exp`) and one not yet valid (`now < nbf`). `now_ms` is the current UNIX
+/// time in milliseconds (`time.now()`); `exp`/`nbf` are in seconds per RFC 7519 and are
+/// optional (a token without them passes). Returns the payload JSON on success.
+pub fn jwt_verify_claims(secret: bytes, token: string, now_ms: int) -> Result<string, string> {
+    let payload_json = jwt_verify(secret, token)?;
+    let j = parse(payload_json)?;
+    match (j) {
+        Json.JObject(m) => {
+            let now_s = now_ms / 1000;
+            match (claim_seconds(m, "exp")) {
+                Option.Some(exp) => {
+                    if (now_s >= exp) {
+                        return Result.Err("token expired");
+                    }
+                },
+                Option.None => { },
+            }
+            match (claim_seconds(m, "nbf")) {
+                Option.Some(nbf) => {
+                    if (now_s < nbf) {
+                        return Result.Err("token not yet valid");
+                    }
+                },
+                Option.None => { },
+            }
+            Result.Ok(payload_json)
+        },
+        _ => Result.Err("the payload is not a JSON object"),
+    }
+}

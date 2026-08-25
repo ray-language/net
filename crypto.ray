@@ -1,0 +1,19 @@
+// Cripto de PRODUCCIÓN para el paquete `net` (M43.5). Adaptadores finos sobre los builtins de `ring`
+// (`sha256`/`hmac_sha256`) que presentan salidas en HEX que los módulos del `net` consumen (sigv4).
+// M60: los shims `*_octets`/`ed_*` (la capa de compat `[int]`↔`bytes`) DESAPARECIERON — hex/base64
+// hablan `bytes` y los consumidores (jwt/jwt_eddsa/scram/websocket) usan `std/crypto` directo.
+// Nombres distintos de los builtins a propósito: un builtin gana a una función homónima, así que
+// un envoltorio con el mismo nombre quedaría muerto.
+import std/crypto;
+
+// SHA-256 en hexadecimal (`to_string` de un `bytes` ya da hex).
+/// SHA-256 digest of `msg` as a lowercase hexadecimal string (64 chars).
+pub fn sha256_hex(msg: bytes) -> string {
+    to_string(crypto.sha256(msg))
+}
+
+// HMAC-SHA256 en hexadecimal.
+/// HMAC-SHA256 of `msg` under `key`, as a lowercase hexadecimal string (64 chars).
+pub fn hmac_sha256_hex(key: bytes, msg: bytes) -> string {
+    to_string(crypto.hmac_sha256(key, msg))
+}
