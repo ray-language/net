@@ -1,3 +1,14 @@
+> **Espejo de solo lectura** — publicado desde
+> [\](https://github.com/roberto-ayala/raylang/tree/main/packages/net);
+> el desarrollo y los PRs van al monorepo.
+>
+> **Instalación** — en tu \:
+>
+> \\\
+>
+> y \ — o la dependencia directa:
+> \.
+
 # `net` — el paquete de red de raylang (adicional, **no** embebido)
 
 A diferencia de la biblioteca estándar (`std/`, embebida en el binario base), el tier de **red y
@@ -23,12 +34,12 @@ como una dependencia git:
 
 ```toml
 [dependencies]
-net = "path:../ruta/a/packages/net"
+net = "git+https://github.com/ray-language/net@v0.1.0"
 ```
 
 y luego importa el módulo que necesites (como con `std/`):
 
-```raylang
+```rust
 import net/jwt;
 
 fn main() -> int {
