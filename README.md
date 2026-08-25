@@ -1,3 +1,5 @@
+# `net` — el paquete de red de raylang (adicional, **no** embebido)
+
 > **Espejo de solo lectura** — publicado desde
 > [`raylang/packages/net`](https://github.com/roberto-ayala/raylang/tree/main/packages/net);
 > el desarrollo y los PRs van al monorepo.
@@ -12,7 +14,6 @@
 > y `ray add net` — o la dependencia directa:
 > `net = "git+https://github.com/ray-language/net@v0.1.0"`.
 
-# `net` — el paquete de red de raylang (adicional, **no** embebido)
 
 A diferencia de la biblioteca estándar (`std/`, embebida en el binario base), el tier de **red y
 protocolos** vive aquí, en un **paquete adicional**: son librerías que dependen de sockets/TLS o que solo
@@ -32,8 +33,8 @@ resistencia a canales laterales de temporización (requisito para tocar secretos
 
 ## Cómo usarlo
 
-Declara el paquete en tu `ray.toml` como una **dependencia por ruta** (M40.8a) — o, cuando se publique,
-como una dependencia git:
+Declara el paquete en tu `ray.toml` (por ruta si desarrollas en el monorepo; git desde el
+espejo publicado):
 
 ```toml
 [dependencies]
