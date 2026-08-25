@@ -1,7 +1,7 @@
 # `net` — el paquete de red de raylang (adicional, **no** embebido)
 
 > **Espejo de solo lectura** — publicado desde
-> [`raylang/packages/net`](https://github.com/roberto-ayala/raylang/tree/main/packages/net);
+> [`raylang/packages/net`](https://github.com/ray-language/raylang/tree/main/packages/net);
 > el desarrollo y los PRs van al monorepo.
 >
 > **Instalación** — en tu `ray.toml`:
