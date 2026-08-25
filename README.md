@@ -1,13 +1,16 @@
 > **Espejo de solo lectura** — publicado desde
-> [\](https://github.com/roberto-ayala/raylang/tree/main/packages/net);
+> [`raylang/packages/net`](https://github.com/roberto-ayala/raylang/tree/main/packages/net);
 > el desarrollo y los PRs van al monorepo.
 >
-> **Instalación** — en tu \:
+> **Instalación** — en tu `ray.toml`:
 >
-> \\\
+> ```toml
+> [registry]
+> index = "git+https://github.com/ray-language/ray-index@main"
+> ```
 >
-> y \ — o la dependencia directa:
-> \.
+> y `ray add net` — o la dependencia directa:
+> `net = "git+https://github.com/ray-language/net@v0.1.0"`.
 
 # `net` — el paquete de red de raylang (adicional, **no** embebido)
 
