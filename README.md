@@ -12,7 +12,7 @@
 > ```
 >
 > y `ray add net` — o la dependencia directa:
-> `net = "git+https://github.com/ray-language/net@v0.3.3"`.
+> `net = "git+https://github.com/ray-language/net@v0.3.4"`.
 
 
 A diferencia de la biblioteca estándar (`std/`, embebida en el binario base), el tier de **red y
@@ -38,7 +38,7 @@ espejo publicado):
 
 ```toml
 [dependencies]
-net = "git+https://github.com/ray-language/net@v0.3.3"
+net = "git+https://github.com/ray-language/net@v0.3.4"
 ```
 
 y luego importa el módulo que necesites (como con `std/`):
