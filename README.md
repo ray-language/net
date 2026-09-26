@@ -9,11 +9,11 @@
 >
 > ```toml
 > [dependencies]
-> net = "^0.3.6"
+> net = "^0.3.7"
 > ```
 >
 > Sin índice, la dependencia git directa:
-> `net = "git+https://github.com/ray-language/net@v0.3.6"`.
+> `net = "git+https://github.com/ray-language/net@v0.3.7"`.
 
 
 A diferencia de la biblioteca estándar (`std/`, embebida en el binario base), el tier de **red y
@@ -43,7 +43,7 @@ net = "^0.3"
 ```
 
 Si desarrollas en el monorepo, por ruta (`net = "path:../ruta/a/packages/net"`); la dependencia
-git directa (`git+https://github.com/ray-language/net@v0.3.6`) queda para un pin sin índice.
+git directa (`git+https://github.com/ray-language/net@v0.3.7`) queda para un pin sin índice.
 
 y luego importa el módulo que necesites (como con `std/`):
 
