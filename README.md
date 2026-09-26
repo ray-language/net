@@ -4,15 +4,16 @@
 > [`raylang/packages/net`](https://github.com/ray-language/raylang/tree/main/packages/net);
 > el desarrollo y los PRs van al monorepo.
 >
-> **Instalación** — en tu `ray.toml`:
+> **Instalación** — `ray add net` en tu proyecto (el índice oficial va por defecto), o a
+> mano en `ray.toml`:
 >
 > ```toml
-> [registry]
-> index = "git+https://github.com/ray-language/ray-index@main"
+> [dependencies]
+> net = "^0.3.6"
 > ```
 >
-> y `ray add net` — o la dependencia directa:
-> `net = "git+https://github.com/ray-language/net@v0.3.5"`.
+> Sin índice, la dependencia git directa:
+> `net = "git+https://github.com/ray-language/net@v0.3.6"`.
 
 
 A diferencia de la biblioteca estándar (`std/`, embebida en el binario base), el tier de **red y
@@ -33,13 +34,16 @@ resistencia a canales laterales de temporización (requisito para tocar secretos
 
 ## Cómo usarlo
 
-Declara el paquete en tu `ray.toml` (por ruta si desarrollas en el monorepo; git desde el
-espejo publicado):
+Declara el paquete en tu `ray.toml`. El camino recomendado es el **índice** (`ray add net`
+lo escribe por ti; con el índice oficial por defecto no hay nada que configurar):
 
 ```toml
 [dependencies]
-net = "git+https://github.com/ray-language/net@v0.3.5"
+net = "^0.3"
 ```
+
+Si desarrollas en el monorepo, por ruta (`net = "path:../ruta/a/packages/net"`); la dependencia
+git directa (`git+https://github.com/ray-language/net@v0.3.6`) queda para un pin sin índice.
 
 y luego importa el módulo que necesites (como con `std/`):
 
