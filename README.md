@@ -9,11 +9,11 @@
 >
 > ```toml
 > [dependencies]
-> net = "^0.8.0"
+> net = "^0.9.0"
 > ```
 >
 > Sin índice, la dependencia git directa:
-> `net = "git+https://github.com/ray-language/net@v0.8.0"`.
+> `net = "git+https://github.com/ray-language/net@v0.9.0"`.
 
 
 A diferencia de la biblioteca estándar (`std/`, embebida en el binario base), el tier de **red y
@@ -82,6 +82,8 @@ fn main() -> int {
   tras DATA, con los helpers de `net/mail`), `send(server, message)` y `send_raw(server, from, to,
   data)` (MIME propio, BCC). Un servidor que no ofrece STARTTLS cuando se exige es error, nunca una
   degradación. Sobre `std/net` + `net/mail`.
+- **`net/webserver`** devuelve **413** a un cuerpo mayor que `max_body_bytes`, **431** a unas cabeceras
+  mayores que `max_header_bytes` y **408** al vencer el plazo de lectura (antes todo era 400; M354).
 - **`net/session_store`** — el almacén de sesiones de `web` como actor con protocolo (`Msg`:
   get/set/delete/drop/sweep), `memory(path, persist, ttl_s)` (RKV1 opcional) y `from_channel` para
   backends propios; el SQLite vive en `db/sessions` (M350). Sobre `std/kv`.
