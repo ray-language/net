@@ -9,11 +9,11 @@
 >
 > ```toml
 > [dependencies]
-> net = "^0.9.0"
+> net = "^0.10.0"
 > ```
 >
 > Sin índice, la dependencia git directa:
-> `net = "git+https://github.com/ray-language/net@v0.9.0"`.
+> `net = "git+https://github.com/ray-language/net@v0.10.0"`.
 
 
 A diferencia de la biblioteca estándar (`std/`, embebida en el binario base), el tier de **red y
@@ -95,7 +95,9 @@ fn main() -> int {
 - **`net/http`** — cliente/servidor HTTP/1.1 en `bytes` (habla `https://` vía el TLS del runtime). Sobre
   `std/inflate` (gunzip). M90.2: conexiones persistentes (keep-alive) con `connect`/`conn_request`/
   `conn_close` — reusa el socket entre peticiones al mismo servidor (delimitación por
-  Content-Length/chunked, reconexión y reintento transparente). M318: `pool(size)` +
+  Content-Length/chunked, reconexión y reintento transparente). M355: plazo de CONEXIÓN — el
+  `timeout_millis` de la petición acota también el dial, `connect` usa
+  `DEFAULT_CONNECT_TIMEOUT_MS` (10 s) y `connect_timeout(base_url, ms)` lo elige (`<= 0` = el del SO). M318: `pool(size)` +
   `pool_fetch`/`pool_request`/`pool_request_bytes` + `pool_close` — un pool de `Conn`s keep-alive
   compartido por todas las fibras (un proxy que abre una conexión por petición agota los puertos). M108: **streaming** —
   `stream`/`stream_with` devuelven status y cabeceras en cuanto llegan y `stream_read` entrega el
@@ -231,7 +233,9 @@ fn main() -> int {
   `from_headers`. El webserver adopta el trace entrante con `trace_of(req)`; el cliente http lo
   propaga con `request_traced`/`fetch_traced` (un span hijo por salto). Hoja (solo `std/random`).
 - **`net/metrics`** — métricas estilo Prometheus (counter/gauge/histogram + labels), `render` en formato
-  de exposición. Hoja.
+  de exposición. Hoja. M359: índices por `Map` (una búsqueda por actualización) y el handle
+  `series(reg, name, labels) -> Series` con `s.inc()/add(v)/set(v)/observe(v)` en O(1) para el camino
+  caliente (antes `observe_l` costaba 82 µs con 20 series; ahora ~7 µs sin handle, menos con él).
 
 Los que dependen de **sockets vivos** (http/http2/websocket/dns/udp/redis/postgres/oauth2) se prueban con
 servidores de juguete, no en el oráculo. El micro-framework web vive en **`packages/web`** (M93,
