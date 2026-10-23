@@ -7,11 +7,11 @@
 >
 > ```toml
 > [dependencies]
-> net = "^0.11.2"
+> net = "^0.11.3"
 > ```
 >
 > Without an index, the direct git dependency:
-> `net = "git+https://github.com/ray-language/net@v0.11.2"`.
+> `net = "git+https://github.com/ray-language/net@v0.11.3"`.
 
 
 A diferencia de la biblioteca estándar (`std/`, embebida en el binario base), el tier de **red y
@@ -68,7 +68,9 @@ fn main() -> int {
   payload)` pone el `kid` en la cabecera (rotación de claves vía JWKS), `jwt_header(token)` /
   `jwt_kid(token)` la leen SIN verificar (para elegir la clave) y `jwt_check_claims(payload, iss,
   aud)` comprueba emisor y audiencia (string o lista) del payload ya verificado — sirve también para
-  EdDSA. Sobre `net/crypto` + `std/base64`.
+  EdDSA. `jwt_verify_claims(secret, token, now_ms)` = firma + `exp`/`nbf`; 0.11.3: un `exp` o `nbf`
+  presente pero no numérico (string, null, lista) invalida el token (RFC 7519 NumericDate; antes se
+  trataba como ausente y el token no caducaba). Sobre `net/crypto` + `std/base64`.
 - **`net/jwt_eddsa`** — JWT firmados con Ed25519 (EdDSA); `jwt_eddsa_sign_kid` para el `kid`. Sobre
   `net/crypto` + `std/base64`.
 - **`net/sigv4`** — firma AWS Signature V4 para peticiones. Sobre `net/crypto` + `std/url`.
