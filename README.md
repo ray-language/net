@@ -7,11 +7,11 @@
 >
 > ```toml
 > [dependencies]
-> net = "^0.11.4"
+> net = "^0.11.5"
 > ```
 >
 > Without an index, the direct git dependency:
-> `net = "git+https://github.com/ray-language/net@v0.11.4"`.
+> `net = "git+https://github.com/ray-language/net@v0.11.5"`.
 
 
 A diferencia de la biblioteca estándar (`std/`, embebida en el binario base), el tier de **red y
@@ -92,7 +92,12 @@ fn main() -> int {
 
 ### HTTP y HTTP/2
 
-- **`net/http`** — cliente/servidor HTTP/1.1 en `bytes` (habla `https://` vía el TLS del runtime). Sobre
+- **`net/http`** — cliente/servidor HTTP/1.1 en `bytes` (habla `https://` vía el TLS del runtime).
+  0.11.5: `request_bytes("HEAD", …)` ya no espera el cuerpo que anuncia `Content-Length` (HEAD, 1xx,
+  204 y 304 no lo traen); `request_pairs(method, url, body, [(nombre, valor)], ms)` manda las
+  cabeceras en orden y con repeticiones, y `Stream.raw_headers` conserva las repetidas
+  (`Set-Cookie`). El cliente añade `Accept-Encoding: gzip` y entrega descomprimida una respuesta
+  gzip, mientras `raw_headers` guarda lo que vino por el cable. Sobre
   `std/inflate` (gunzip). M90.2: conexiones persistentes (keep-alive) con `connect`/`conn_request`/
   `conn_close` — reusa el socket entre peticiones al mismo servidor (delimitación por
   Content-Length/chunked, reconexión y reintento transparente). M355: plazo de CONEXIÓN — el
