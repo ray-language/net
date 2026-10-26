@@ -7,11 +7,11 @@
 >
 > ```toml
 > [dependencies]
-> net = "^0.12.0"
+> net = "^0.12.1"
 > ```
 >
 > Without an index, the direct git dependency:
-> `net = "git+https://github.com/ray-language/net@v0.12.0"`.
+> `net = "git+https://github.com/ray-language/net@v0.12.1"`.
 
 
 A diferencia de la biblioteca estándar (`std/`, embebida en el binario base), el tier de **red y
@@ -93,6 +93,10 @@ fn main() -> int {
 ### HTTP y HTTP/2
 
 - **`net/http`** — cliente/servidor HTTP/1.1 en `bytes` (habla `https://` vía el TLS del runtime).
+  0.12.1: la respuesta de `request*` termina al completar su `Content-Length` (o el último chunk)
+  aunque el servidor no cierre la conexión (rayreq #275; antes, «read timeout»); una cabecera
+  `Host` o `Connection` del llamador SUSTITUYE a la del cliente, un `Content-Length` que no cuadra
+  con el cuerpo o un `Transfer-Encoding` son `Err` (rayreq #277; antes salían las dos líneas).
   0.12.0 (raylang 1.27.81): `request_opts(method, url, body, pares, http.options())` con
   `Options { timeout_millis, insecure_skip_verify }` — aceptar cualquier certificado solo en esa
   forma explícita, para desarrollo; la vía buena es confiar en tu CA con `SSL_CERT_FILE=ca.pem`, que
