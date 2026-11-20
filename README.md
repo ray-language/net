@@ -7,11 +7,11 @@
 >
 > ```toml
 > [dependencies]
-> net = "^0.15.0"
+> net = "^0.15.1"
 > ```
 >
 > Without an index, the direct git dependency:
-> `net = "git+https://github.com/ray-language/net@v0.15.0"`.
+> `net = "git+https://github.com/ray-language/net@v0.15.1"`.
 
 
 A diferencia de la biblioteca estándar (`std/`, embebida en el binario base), el tier de **red y
@@ -21,8 +21,8 @@ las `std/` embebidas para lo fundacional (`from std/base64 import …`).
 
 Este es el **tier 2** del ecosistema (paquete adicional, no embebido). La regla de qué va aquí vs. en `std/`
 vs. como demo en `examples/` está en la **política de tiers** ([DESIGN.md](../../DESIGN.md) §53); la
-instalación por nombre desde un registro central se diseña en §54 (M51). Hoy se consume por dependencia de
-ruta/git en `ray.toml`.
+instalación es por nombre desde el índice (`ray add net`); la dependencia de ruta/git en `ray.toml` queda
+para el monorepo o un pin sin índice.
 
 **Criptografía de producción (M43)**: el módulo `net/crypto` expone SHA/HMAC/Ed25519 respaldados por
 `ring` (tiempo constante, auditado) en la forma (`[int]`/hex) que estos módulos consumen. Las
@@ -37,7 +37,7 @@ lo escribe por ti; con el índice oficial por defecto no hay nada que configurar
 
 ```toml
 [dependencies]
-net = "^0.11"
+net = "^0.15"
 ```
 
 Si desarrollas en el monorepo, por ruta (`net = "path:../ruta/a/packages/net"`); la dependencia
@@ -205,6 +205,16 @@ fn main() -> int {
 - **`net/oauth2`** — flujo OAuth2 (client credentials, authorization code). Sobre `net/http` + `std/json`
   + `std/url`.
 - **`net/webserver`** — servidor HTTP async + SSE (sobre el scheduler de fibras). Sobre `std/url`.
+  0.15.1: **`serve_raw_on(listener, handler)`**, `serve_raw_on_limits` y `serve_raw_with_on`
+  (raycdc #406) — el handler crudo (petición + conexión: un upgrade a WebSocket, SSE) sobre un
+  listener ya abierto, para enlazar el puerto 0 y conocerlo antes de servir. El upgrade:
+  `net.socket_write(conn, websocket.handshake_response(req.headers.get_or("sec-websocket-key", "")))`
+  y después `websocket.server_conn(conn)` + `read_message`. Con **`quiet()`**, el cliente que
+  corta a mitad de la respuesta (EPIPE, ECONNRESET) ya no se anota en stderr (raycrawl #371): es
+  el cliente que se va, como los 400 y 408. `net/scram` deriva la clave con
+  `crypto.pbkdf2_hmac_sha256` (raycdc #408: 44 ms → 1 ms por conexión a mongod en la VM), y
+  `net/grpc_server` responde UNIMPLEMENTED a una ruta sin handler en cuanto llegan las
+  cabeceras, sin esperar a que el cliente cierre su lado (raygrpc #385).
   0.15.0 (rayblob #284): **cuerpo de la petición bajo demanda** — `options().with_body_stream()`
   deja el cuerpo en la conexión: `req.body` llega vacío, `req.body_stream` es `Some(BodyStream)` y el
   handler tira de él con `next_body_chunk(req) -> Result<Option<bytes>, string>` (un trozo por
@@ -249,7 +259,7 @@ fn main() -> int {
   ambiguo (error), y una conexión keep-alive (`Conn`, `Pool`) a la que le sobran octetos tras una
   respuesta se descarta en vez de entregarlos como la respuesta siguiente. HTTPS con `serve_tls`/`serve_raw_tls[_limits]
   (M56.3: cert/clave en PEM; upgrade TLS por conexión, en su fibra). Un handler que panica responde
-  500 y cierra su conexión sin tumbar el servidor ni fugar recursos (M56.5, vía `try_join`).
+  500 y cierra su conexión sin tumbar el servidor ni fugar recursos (M56.5; desde M97.2 vía `try_call`, en la fibra de la conexión).
   `serve`/`serve_tls` mantienen la conexión viva entre peticiones (M56.6: keep-alive HTTP/1.1;
   honran `Connection: close` y el ocio lo corta el read timeout); `serve_raw` sigue siendo
   una-petición-y-cerrar (el handler crudo posee la conexión — SSE). Varias cookies por respuesta
