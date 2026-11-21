@@ -7,11 +7,11 @@
 >
 > ```toml
 > [dependencies]
-> net = "^0.17.0"
+> net = "^0.17.1"
 > ```
 >
 > Without an index, the direct git dependency:
-> `net = "git+https://github.com/ray-language/net@v0.17.0"`.
+> `net = "git+https://github.com/ray-language/net@v0.17.1"`.
 
 
 A diferencia de la biblioteca estándar (`std/`, embebida en el binario base), el tier de **red y
@@ -152,6 +152,10 @@ fn main() -> int {
 - **`net/hpack`** — compresión de cabeceras HPACK (RFC 7541): `header`, `encode`, `decode` + tabla
   dinámica. Determinista. Hoja.
 - **`net/http2_client`** — cliente HTTP/2 sobre `net/http2` + `net/hpack`.
+  0.17.1 (raycdc #468): `net/websocket` gana `is_upgrade(headers)` y `accept(headers, conn)` —
+  el upgrade de un handler crudo es `if (websocket.is_upgrade(req.headers)) { let ws =
+  websocket.accept(req.headers, conn)?; … }`. El ejemplo de `serve_raw_on` citaba un
+  `is_upgrade(req)` que no existía.
 - **`net/grpc_client`** — cliente gRPC de un solo disparo sobre TLS (`grpc_call`), sobre `net/http2` +
   `net/hpack` + `std/protobuf`.
 - **`net/grpc_server`** — **servidor gRPC unario** sobre HTTP/2 en claro con conocimiento previo (h2c:
