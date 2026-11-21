@@ -58,17 +58,29 @@ pub fn handshake_response(key: string) -> string {
 }
 
 /// Whether a request asks to switch to WebSocket: `headers` are the request's headers (lower-case
-/// names, as `webserver.Request.headers` has them) and it needs `Upgrade: websocket` and a
-/// `Sec-WebSocket-Key` (net 0.17.1, raycdc #468).
+/// names, as `webserver.Request.headers` has them) and it needs `websocket` among the tokens of
+/// `Upgrade` (a token, not a substring, since net 0.17.2) and a `Sec-WebSocket-Key` (net 0.17.1,
+/// raycdc #468).
 pub fn is_upgrade(headers: Map<string, string>) -> bool {
-    headers.get_or("upgrade", "").to_lower().contains("websocket")
+    has_token(headers.get_or("upgrade", ""), "websocket")
         && headers.get_or("sec-websocket-key", "") != ""
+}
+
+// ¿Está `token` en la lista separada por comas de una cabecera? (`Upgrade: h2c, websocket`.)
+fn has_token(value: string, token: string) -> bool {
+    for part in value.to_lower().split(",") {
+        if (part.trim() == token) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Completes the server side of the handshake on `conn` for a request that `is_upgrade`: writes
 /// the `101 Switching Protocols` response and returns the connection ready for `read_message` and
-/// `encode_frame`. `Err` when the request is not an upgrade or the write fails. In a raw handler:
-/// `if (websocket.is_upgrade(req.headers)) { let ws = websocket.accept(req.headers, conn)?; … }`.
+/// `encode_frame`. `Err` when the request is not an upgrade (nothing is written) or the write
+/// fails. In a raw handler:
+/// `match (websocket.accept(req.headers, conn)) { Result.Ok(ws) => { … }, Result.Err(_) => { } }`.
 pub fn accept(headers: Map<string, string>, conn: int) -> Result<WsConn, string> {
     if (!is_upgrade(headers)) {
         return Result.Err("websocket: the request is not an upgrade");
