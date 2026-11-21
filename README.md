@@ -7,11 +7,11 @@
 >
 > ```toml
 > [dependencies]
-> net = "^0.15.1"
+> net = "^0.17.0"
 > ```
 >
 > Without an index, the direct git dependency:
-> `net = "git+https://github.com/ray-language/net@v0.15.1"`.
+> `net = "git+https://github.com/ray-language/net@v0.17.0"`.
 
 
 A diferencia de la biblioteca estándar (`std/`, embebida en el binario base), el tier de **red y
@@ -103,6 +103,15 @@ fn main() -> int {
 ### HTTP y HTTP/2
 
 - **`net/http`** — cliente/servidor HTTP/1.1 en `bytes` (habla `https://` vía el TLS del runtime).
+  0.16.0 (raycrawl #370): **streaming sobre una conexión persistente** —
+  `conn_stream(c, method, path, body, headers, idle_ms)` y
+  `pool_stream(p, method, url, body, headers, idle_ms)` devuelven el mismo `Stream` de
+  `stream_with`, pero el socket es el de la `Conn`: al leer el cuerpo hasta el final
+  (`stream_read` → `Ok(None)`) la conexión queda lista para la siguiente petición (o vuelve al
+  pool). Cortar antes con `stream_close` descarta el socket —el cuerpo sin leer no se puede
+  saltar— y la `Conn` reconecta en su siguiente uso. Para un tope de bytes: leer hasta el tope
+  y cerrar. Con `pool_stream`, terminar SIEMPRE el stream (leerlo entero o `stream_close`), o
+  el hueco del pool queda ocupado.
   0.12.1: la respuesta de `request*` termina al completar su `Content-Length` (o el último chunk)
   aunque el servidor no cierre la conexión (rayreq #275; antes, «read timeout»); una cabecera
   `Host` o `Connection` del llamador SUSTITUYE a la del cliente, un `Content-Length` que no cuadra
@@ -154,11 +163,36 @@ fn main() -> int {
   flujo, `grpc-timeout` → `deadline` (y DEADLINE_EXCEEDED al vencer), metadata, `grpc-message`
   percent-encoded, tope de 4 MiB (`Options.max_message`, RESOURCE_EXHAUSTED), UNIMPLEMENTED para rutas
   sin handler, `serve_conn` para bucles de accept propios. Sobre `net/grpc_h2`.
+  **0.17.0** (raygrpc #385/#386): **streaming, cabeceras y trailers, TLS y reflexión**.
+  `route_stream(r, path, f)` registra un handler `fn(ServerStream) -> Status` que sirve los
+  tres modos (server-streaming, client-streaming, bidireccional) según use `recv(s)` (el
+  siguiente mensaje, `Ok(None)` cuando el cliente cierra su lado) y `send(s, msg)`; arranca al
+  llegar las cabeceras. Mientras un handler espera en `recv` (o en `idle(s, ms)`, para el que
+  espera un evento propio), las demás llamadas de la conexión se atienden: `grpcurl` deja abierto
+  el stream de reflexión y llama por la misma conexión. Un handler unario añade cabeceras y
+  trailers con `set_header(c, name, value)` / `set_trailer(c, name, value)` (también con un
+  estado de error); uno de streaming, con `stream_header` / `stream_trailer`.
+  `bind_tls(host, port, cert_pem, key_pem)` da un listener TLS con ALPN `h2`. La reflexión vive
+  en **`net/grpc_reflection`**: `enable(r, files)` añade `grpc.reflection.v1` y `v1alpha` (la
+  lista de servicios sale de las rutas; `files` son `FileDescriptorProto` serializados para
+  `describe`, `[]` si no los hay) y `files_of_set(bytes)` trocea lo que escribe
+  `protoc --descriptor_set_out --include_imports`. Los streams de una conexión se anidan: mientras
+  corre un segundo, el primero espera, y como mucho hay `MAX_NESTED_STREAMS` (16) abiertos a la
+  vez — una suscripción de larga vida, mejor en su propia conexión. `new_call(path, message,
+  metadata)` construye un `Call` para probar un handler con `dispatch` sin levantar el servidor.
 - **`net/grpc_conn`** — cliente gRPC unario sobre una **conexión persistente**: `connect(host, port)`
   (h2c) o `connect_tls(host, port)` (ALPN `h2`), `call(c, path, message, metadata, deadline_ms) ->
   Result<Reply, string>` (`Err` = transporte; un estado no-OK es `Ok(Reply)` con `status` y
   `status_message`; `into_result`/`outcome` lo vuelven `Result<bytes, Status>`), `call_once`,
   `usable`, `disconnect`. Un plazo vencido cancela el stream (RST_STREAM) y la conexión sigue usable.
+  **0.17.0** (raygrpc #387): `Reply` separa `headers` y `trailers` (`metadata` sigue siendo
+  los dos juntos). **Streams**: `open_stream(c, path, metadata, deadline_ms)`,
+  `stream_send(s, msg)`, `stream_close_send(s)`, `stream_recv(s) -> Result<Option<bytes>, string>`
+  (`Ok(None)` = el servidor terminó), `stream_reply(s)` (estado, cabeceras y trailers) y
+  `stream_cancel(s)`; uno a la vez por conexión. `call_once_tls` es la llamada de un disparo
+  sobre TLS con metadatos y plazo. `connect_tls_opts(host, port, opts: net.TlsOptions)` da las
+  opciones TLS por conexión: una CA propia (`ca_pem`, sin tocar `SSL_CERT_FILE`), el modo sin
+  verificar (`insecure`) y los protocolos ALPN a ofrecer. Pide raylang 1.27.110.
 - **`net/grpc_status`** — los códigos gRPC (`OK`…`UNAUTHENTICATED`), `Status { code, message }`,
   `new`/`fail`, `code_name`, `from_http` y el percent-encoding de `grpc-message`. Hoja.
 - **`net/grpc_h2`** — el núcleo de conexión HTTP/2 que comparten servidor y cliente (`Link`: frames
