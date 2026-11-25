@@ -7,11 +7,11 @@
 >
 > ```toml
 > [dependencies]
-> net = "^0.18.0"
+> net = "^0.18.1"
 > ```
 >
 > Without an index, the direct git dependency:
-> `net = "git+https://github.com/ray-language/net@v0.18.0"`.
+> `net = "git+https://github.com/ray-language/net@v0.18.1"`.
 
 
 A diferencia de la biblioteca estándar (`std/`, embebida en el binario base), el tier de **red y
